@@ -3,11 +3,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from aw_core.models import Event
+from timeslot import Timeslot
 from aw_transform import (
+    active_periods_v2,
     filter_period_intersect,
     filter_keyvals_regex,
     filter_keyvals,
     merge_subwatcher_fields,
+    map_event_fields,
     period_union,
     sort_by_timestamp,
     sort_by_duration,
@@ -19,10 +22,28 @@ from aw_transform import (
     union,
     union_no_overlap,
     categorize,
+    categorize_v2,
+    categorize_v2_explain,
     tag,
     Rule,
 )
 from aw_transform.filter_period_intersect import _intersecting_eventpairs
+
+
+def test_map_event_fields_copies_canonical_values():
+    event = Event(data={"subject": "Planning", "provider": "Teams"})
+    result = map_event_fields([event], {"title": "subject", "app": "provider"})[0]
+
+    assert result.data["title"] == "Planning"
+    assert result.data["app"] == "Teams"
+
+
+def test_map_event_fields_reads_all_values_before_writing_targets():
+    event = Event(data={"provider": "Teams", "app": "Original"})
+    result = map_event_fields([event], {"app": "provider", "title": "app"})[0]
+
+    assert result.data["app"] == "Teams"
+    assert result.data["title"] == "Original"
 
 
 def test_simplify_string():
@@ -42,6 +63,143 @@ def test_simplify_string():
     assert (
         simplify_string(events, "title")[0].data["title"]
         == "report.md - Visual Studio Code"
+    )
+
+
+def test_active_periods_v2_intersects_overlapping_rules():
+    start = datetime.now(timezone.utc).replace(microsecond=0)
+    sources = [
+        [
+            "window",
+            [
+                Event(
+                    timestamp=start,
+                    duration=timedelta(minutes=10),
+                    data={"app": "Teams"},
+                )
+            ],
+        ],
+        [
+            "afk",
+            [
+                Event(
+                    timestamp=start + timedelta(minutes=3),
+                    duration=timedelta(minutes=4),
+                    data={"status": "not-afk"},
+                )
+            ],
+        ],
+    ]
+    result = active_periods_v2(
+        sources,
+        {
+            "type": "all",
+            "rules": [
+                {
+                    "type": "regex",
+                    "source": "window",
+                    "field": "app",
+                    "regex": "Teams",
+                },
+                {
+                    "type": "regex",
+                    "source": "afk",
+                    "field": "status",
+                    "regex": "^not-afk$",
+                },
+            ],
+        },
+    )
+
+    assert len(result) == 1
+    assert result[0].timestamp == start + timedelta(minutes=3)
+    assert result[0].duration == timedelta(minutes=4)
+
+
+def test_active_periods_v2_unions_and_negates_rules():
+    start = datetime.now(timezone.utc).replace(microsecond=0)
+    sources = [
+        [
+            "window",
+            [
+                Event(
+                    timestamp=start,
+                    duration=timedelta(minutes=2),
+                    data={"app": "Editor"},
+                ),
+                Event(
+                    timestamp=start + timedelta(minutes=4),
+                    duration=timedelta(minutes=2),
+                    data={"app": "Blocked"},
+                ),
+            ],
+        ],
+        [
+            "meeting",
+            [
+                Event(
+                    timestamp=start + timedelta(minutes=2),
+                    duration=timedelta(minutes=2),
+                    data={"subject": "Standup"},
+                )
+            ],
+        ],
+    ]
+    result = active_periods_v2(
+        sources,
+        {
+            "type": "any",
+            "rules": [
+                {
+                    "type": "regex",
+                    "source": "window",
+                    "field": "app",
+                    "regex": "^Blocked$",
+                    "negate": True,
+                },
+                {
+                    "type": "regex",
+                    "source": "meeting",
+                    "field": "subject",
+                    "regex": "Standup",
+                },
+            ],
+        },
+    )
+
+    assert len(result) == 1
+    assert result[0].timestamp == start
+    assert result[0].duration == timedelta(minutes=4)
+
+
+def test_active_periods_v2_rejects_unknown_sources():
+    with pytest.raises(ValueError, match="unknown source"):
+        active_periods_v2(
+            [],
+            {
+                "type": "regex",
+                "source": "missing",
+                "field": "status",
+                "regex": "active",
+            },
+        )
+
+
+def test_active_periods_v2_matches_optional_host():
+    event = Event(data={"app": "editor"})
+    expression = {
+        "type": "regex",
+        "source": "window",
+        "host": "workstation",
+        "field": "app",
+        "regex": "editor",
+    }
+
+    assert active_periods_v2(
+        [["window", [event]]], expression, "workstation"
+    )
+    assert not active_periods_v2(
+        [["window", [event]]], expression, "laptop"
     )
 
     events = [Event(data={"app": "Gedit", "title": "*test.md - gedit"})]
@@ -418,6 +576,388 @@ def test_categorize():
     assert events[3].data["$category"] == ["Uncategorized"]
 
 
+def test_categorize_v2_nested_rules_and_scores():
+    event = Event(
+        data={
+            "app": "devenv.exe",
+            "$source.vdesktop.vdesktop": "Personal",
+        }
+    )
+    categories = [
+        {
+            "id": "work",
+            "name": ["Work"],
+            "rule": {"type": "regex", "field": "app", "regex": "devenv"},
+        },
+        {
+            "id": "personal",
+            "name": ["Personal"],
+            "rule": {
+                "type": "all",
+                "rules": [
+                    {"type": "regex", "field": "app", "regex": "devenv"},
+                    {
+                        "type": "regex",
+                        "source": "vdesktop",
+                        "field": "vdesktop",
+                        "regex": "^Personal$",
+                        "weight": 10,
+                    },
+                ],
+            },
+        },
+    ]
+
+    result = categorize_v2([event], categories)[0]
+    assert result.data["$category"] == ["Personal"]
+    assert result.data["$category_score"] == 10
+    assert result.data["$category_rule"] == "personal"
+
+
+def test_categorize_v2_any_uses_highest_matching_branch_only():
+    event = Event(data={"app": "devenv.exe", "title": "ActivityWatch"})
+    categories = [
+        {
+            "name": ["Work"],
+            "rule": {
+                "type": "any",
+                "rules": [
+                    {
+                        "type": "regex",
+                        "field": "app",
+                        "regex": "devenv",
+                        "weight": 2,
+                    },
+                    {
+                        "type": "regex",
+                        "field": "title",
+                        "regex": "ActivityWatch",
+                        "weight": 5,
+                    },
+                ],
+            },
+        }
+    ]
+
+    result = categorize_v2([event], categories)[0]
+    assert result.data["$category_score"] == 5
+
+
+def test_categorize_v2_explain_includes_branches_and_parent_gates():
+    categories = [
+        {
+            "id": "parent",
+            "name": ["Work"],
+            "rule": {"type": "regex", "field": "app", "regex": "Code"},
+        },
+        {
+            "id": "child",
+            "name": ["Work", "Project"],
+            "requires": ["parent"],
+            "rule": {
+                "type": "any",
+                "rules": [
+                    {"type": "regex", "field": "title", "regex": "Other", "weight": 1},
+                    {"type": "regex", "field": "title", "regex": "Project", "weight": 5},
+                ],
+            },
+        },
+    ]
+    result = categorize_v2_explain(
+        [Event(data={"app": "Code", "title": "Project"})], categories
+    )[0]
+    explain = result.data["$category_explain"]
+
+    assert explain["winner"] == "child"
+    child = next(candidate for candidate in explain["candidates"] if candidate["id"] == "child")
+    assert child["eligible"] is True
+    assert child["requirements"] == {"parent": True}
+    assert child["expression"]["selected"] == 1
+
+
+def test_categorize_v2_parent_requirements_are_gates():
+    event = Event(data={"app": "devenv.exe", "title": "Project Alpha"})
+    categories = [
+        {
+            "id": "project",
+            "name": ["Project Alpha"],
+            "rule": {"type": "regex", "field": "title", "regex": "Project Alpha"},
+        },
+        {
+            "id": "project-code",
+            "name": ["Project Alpha", "Code"],
+            "requires": ["project"],
+            "rule": {"type": "regex", "field": "app", "regex": "devenv"},
+        },
+        {
+            "id": "other-code",
+            "name": ["Other", "Code"],
+            "requires": ["missing-project-match"],
+            "rule": {"type": "regex", "field": "app", "regex": "devenv"},
+        },
+        {
+            "id": "missing-project-match",
+            "name": ["Other"],
+            "rule": {"type": "regex", "field": "title", "regex": "Other"},
+        },
+    ]
+
+    result = categorize_v2([event], categories)[0]
+    assert result.data["$category"] == ["Project Alpha", "Code"]
+
+
+def test_categorize_v2_negative_requires_a_present_field():
+    categories = [
+        {
+            "name": ["Not Personal"],
+            "rule": {
+                "type": "regex",
+                "field": "vdesktop",
+                "regex": "^Personal$",
+                "negate": True,
+            },
+        }
+    ]
+    missing = categorize_v2([Event(data={"app": "test"})], categories)[0]
+    present = categorize_v2(
+        [Event(data={"app": "test", "vdesktop": "Work"})], categories
+    )[0]
+
+    assert missing.data["$category"] == ["Uncategorized"]
+    assert present.data["$category"] == ["Not Personal"]
+
+
+def test_categorize_v2_weight_zero_preserves_depth_and_last_wins():
+    event = Event(data={"title": "matching"})
+    categories = [
+        {
+            "id": "first",
+            "name": ["First"],
+            "rule": {"type": "regex", "regex": "matching"},
+        },
+        {
+            "id": "deep",
+            "name": ["First", "Deep"],
+            "rule": {"type": "regex", "regex": "matching"},
+        },
+        {
+            "id": "last",
+            "name": ["Last", "Deep"],
+            "rule": {"type": "regex", "regex": "matching"},
+        },
+    ]
+
+    result = categorize_v2([event], categories)[0]
+    assert result.data["$category"] == ["Last", "Deep"]
+
+
+def test_categorize_v2_preserves_legacy_field_selection():
+    categories = [
+        {
+            "id": "all-fields",
+            "name": ["All fields"],
+            "rule": {"type": "regex", "regex": "match"},
+        },
+        {
+            "id": "selected-fields",
+            "name": ["Selected fields"],
+            "rule": {
+                "type": "regex",
+                "fields": ["app", "title"],
+                "regex": "match",
+            },
+        },
+    ]
+
+    all_fields = categorize_v2(
+        [Event(data={"project": "match", "app": "other"})], categories
+    )[0]
+    selected_fields = categorize_v2(
+        [Event(data={"project": "other", "title": "match"})], categories
+    )[0]
+
+    assert all_fields.data["$category"] == ["All fields"]
+    assert selected_fields.data["$category"] == ["Selected fields"]
+
+
+def test_categorize_v2_scalar_matching_is_opt_in():
+    string_only = [
+        {
+            "name": ["String only"],
+            "rule": {"type": "regex", "field": "audible", "regex": "^true$"},
+        }
+    ]
+    scalar = [
+        {
+            "name": ["Scalar"],
+            "rule": {
+                "type": "regex",
+                "field": "audible",
+                "regex": "^true$",
+                "value_mode": "scalar",
+            },
+        }
+    ]
+
+    assert categorize_v2([Event(data={"audible": True})], string_only)[0].data[
+        "$category"
+    ] == [
+        "Uncategorized"
+    ]
+    assert categorize_v2([Event(data={"audible": True})], scalar)[0].data[
+        "$category"
+    ] == ["Scalar"]
+
+
+def test_categorize_v2_rejects_dependency_cycles():
+    categories = [
+        {
+            "id": "a",
+            "name": ["A"],
+            "requires": ["b"],
+            "rule": {"type": "regex", "regex": "test"},
+        },
+        {
+            "id": "b",
+            "name": ["B"],
+            "requires": ["a"],
+            "rule": {"type": "regex", "regex": "test"},
+        },
+    ]
+
+    with pytest.raises(ValueError, match="dependency cycle"):
+        categorize_v2([Event(data={"title": "test"})], categories)
+
+
+def test_categorize_v2_supports_maximum_length_dependency_chain():
+    categories = []
+    for index in range(1000):
+        categories.append(
+            {
+                "id": f"rule-{index}",
+                "name": [f"Rule {index}"],
+                "requires": [f"rule-{index - 1}"] if index else [],
+                "rule": {"type": "regex", "field": "title", "regex": "match"},
+            }
+        )
+
+    result = categorize_v2([Event(data={"title": "match"})], categories)[0]
+
+    assert result.data["$category"] == ["Rule 999"]
+
+
+def test_categorize_v2_source_named_base_uses_its_namespace():
+    categories = [
+        {
+            "name": ["Base"],
+            "rule": {
+                "type": "regex",
+                "source": "base",
+                "regex": "Personal",
+            },
+        }
+    ]
+    event = Event(data={"app": "devenv.exe", "$source.base.name": "Personal"})
+
+    result = categorize_v2([event], categories)[0]
+    assert result.data["$category"] == ["Base"]
+
+
+def test_categorize_v2_default_source_excludes_enriched_fields():
+    categories = [
+        {
+            "name": ["Base"],
+            "rule": {
+                "type": "regex",
+                "regex": "Personal",
+            },
+        }
+    ]
+    event = Event(data={"app": "devenv.exe", "$source.vdesktop.name": "Personal"})
+
+    result = categorize_v2([event], categories)[0]
+    assert result.data["$category"] == ["Uncategorized"]
+
+
+def test_categorize_v2_is_repeatable():
+    categories = [
+        {
+            "id": "first-rule",
+            "name": ["First"],
+            "rule": {"type": "regex", "field": "title", "regex": "match"},
+        },
+        {
+            "id": "matches-only-metadata",
+            "name": ["First", "Metadata"],
+            "rule": {"type": "regex", "regex": "first-rule"},
+        },
+    ]
+    event = Event(data={"title": "match"})
+
+    first = categorize_v2([event], categories)[0]
+    assert first.data["$category"] == ["First"]
+    second = categorize_v2([first], categories)[0]
+    assert second.data["$category"] == ["First"]
+
+
+def test_categorize_v2_rejects_invalid_regex():
+    categories = [
+        {
+            "name": ["Invalid"],
+            "rule": {"type": "regex", "regex": "["},
+        }
+    ]
+
+    with pytest.raises(ValueError, match="invalid regex"):
+        categorize_v2([Event(data={"title": "test"})], categories)
+
+
+def test_categorize_v2_enforces_expression_limits():
+    nested = {"type": "regex", "regex": "test"}
+    for _ in range(32):
+        nested = {"type": "all", "rules": [nested]}
+
+    with pytest.raises(ValueError, match="maximum depth"):
+        categorize_v2(
+            [Event(data={"title": "test"})],
+            [{"name": ["Too deep"], "rule": nested}],
+        )
+    with pytest.raises(ValueError, match="maximum length"):
+        categorize_v2(
+            [Event(data={"title": "test"})],
+            [
+                {
+                    "name": ["Too long"],
+                    "rule": {"type": "regex", "regex": "x" * 4097},
+                }
+            ],
+        )
+
+
+def test_categorize_v2_matches_optional_host():
+    categories = [
+        {
+            "name": ["Workstation"],
+            "rule": {
+                "type": "regex",
+                "host": "workstation",
+                "field": "app",
+                "regex": "editor",
+            },
+        }
+    ]
+
+    matching = categorize_v2(
+        [Event(data={"app": "editor"})], categories, "workstation"
+    )[0]
+    other = categorize_v2(
+        [Event(data={"app": "editor"})], categories, "laptop"
+    )[0]
+    assert matching.data["$category"] == ["Workstation"]
+    assert other.data["$category"] == ["Uncategorized"]
+    assert "$host" not in matching.data
+
+
 def test_tags():
     now = datetime.now(timezone.utc)
 
@@ -566,6 +1106,147 @@ def test_merge_subwatcher_fields_overlapping_subwatchers_prefer_latest_start():
     assert sum_durations(result) == td1h
 
 
+def test_merge_subwatcher_fields_sweep_preserves_long_lived_overlap():
+    now = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    base = [
+        Event(
+            timestamp=now + timedelta(hours=2),
+            duration=timedelta(hours=1),
+            data={"app": "vim", "base": "second"},
+        ),
+        Event(
+            timestamp=now,
+            duration=timedelta(hours=1),
+            data={"app": "vim", "base": "first"},
+        ),
+    ]
+    sub = [
+        Event(
+            timestamp=now,
+            duration=timedelta(hours=4),
+            data={"project": "long-lived"},
+        ),
+        Event(
+            timestamp=now + timedelta(minutes=30),
+            duration=timedelta(minutes=15),
+            data={"project": "newer"},
+        ),
+    ]
+
+    result = merge_subwatcher_fields(base, sub, ["project"])
+
+    assert result[0].timestamp == now + timedelta(hours=2)
+    assert result[0].data["project"] == "long-lived"
+    assert [event.data["project"] for event in result[1:]] == [
+        "long-lived",
+        "newer",
+        "long-lived",
+    ]
+    assert sum_durations(result) == timedelta(hours=2)
+
+
+def test_merge_subwatcher_fields_expiration_reveals_older_active_events():
+    now = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    base = [
+        Event(timestamp=now, duration=timedelta(minutes=60), data={"app": "vim"})
+    ]
+    sub = [
+        Event(
+            timestamp=now,
+            duration=timedelta(minutes=60),
+            data={"project": "oldest"},
+        ),
+        Event(
+            timestamp=now + timedelta(minutes=10),
+            duration=timedelta(minutes=20),
+            data={"project": "middle"},
+        ),
+        Event(
+            timestamp=now + timedelta(minutes=15),
+            duration=timedelta(minutes=5),
+            data={"project": "newest"},
+        ),
+    ]
+
+    result = merge_subwatcher_fields(base, sub, ["project"])
+
+    assert [event.data["project"] for event in result] == [
+        "oldest",
+        "middle",
+        "newest",
+        "middle",
+        "oldest",
+    ]
+    assert [event.duration for event in result] == [
+        timedelta(minutes=10),
+        timedelta(minutes=5),
+        timedelta(minutes=5),
+        timedelta(minutes=10),
+        timedelta(minutes=30),
+    ]
+
+
+def test_merge_subwatcher_fields_same_start_prefers_longest_end():
+    now = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    base = [
+        Event(timestamp=now, duration=timedelta(minutes=60), data={"app": "vim"})
+    ]
+    sub = [
+        Event(
+            timestamp=now,
+            duration=timedelta(minutes=20),
+            data={"project": "short"},
+        ),
+        Event(
+            timestamp=now,
+            duration=timedelta(minutes=40),
+            data={"project": "long"},
+        ),
+    ]
+
+    result = merge_subwatcher_fields(base, sub, ["project"])
+
+    assert len(result) == 2
+    assert result[0].data["project"] == "long"
+    assert result[0].duration == timedelta(minutes=40)
+    assert "project" not in result[1].data
+    assert result[1].duration == timedelta(minutes=20)
+
+
+def test_merge_subwatcher_fields_sweep_checks_each_overlap_once(monkeypatch):
+    now = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    transition_count = 500
+    base = [
+        Event(
+            timestamp=now,
+            duration=timedelta(seconds=transition_count),
+            data={"app": "vim"},
+        )
+    ]
+    sub = [
+        Event(
+            timestamp=now + timedelta(seconds=i),
+            duration=timedelta(seconds=1),
+            data={"project": str(i)},
+        )
+        for i in range(transition_count)
+    ]
+    intersection_calls = 0
+    original_intersection = Timeslot.intersection
+
+    def counting_intersection(self, other):
+        nonlocal intersection_calls
+        intersection_calls += 1
+        return original_intersection(self, other)
+
+    monkeypatch.setattr(Timeslot, "intersection", counting_intersection)
+
+    result = merge_subwatcher_fields(base, sub, ["project"])
+
+    assert len(result) == transition_count
+    assert intersection_calls <= transition_count + 1
+
+
 def test_merge_subwatcher_fields_no_overlap():
     """Base events with no overlapping subwatcher event are returned unchanged."""
     now = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -683,3 +1364,42 @@ def test_merge_subwatcher_fields_invalid_conflict():
 
     with pytest.raises(ValueError, match="conflict must be"):
         merge_subwatcher_fields(base, sub, ["project"], conflict="invalid")
+
+
+def test_merge_subwatcher_fields_namespaces_source_fields():
+    now = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+    base = [
+        Event(
+            timestamp=now,
+            duration=timedelta(minutes=10),
+            data={"app": "devenv.exe", "title": "ActivityWatch"},
+        )
+    ]
+    sub = [
+        Event(
+            timestamp=now + timedelta(minutes=3),
+            duration=timedelta(minutes=4),
+            data={"vdesktop": "Personal"},
+        )
+    ]
+
+    result = merge_subwatcher_fields(
+        base, sub, ["vdesktop"], source_id="vdesktop"
+    )
+
+    assert [event.duration for event in result] == [
+        timedelta(minutes=3),
+        timedelta(minutes=4),
+        timedelta(minutes=3),
+    ]
+    assert "$source.vdesktop.vdesktop" not in result[0].data
+    assert result[1].data["$source.vdesktop.vdesktop"] == "Personal"
+    assert "$source.vdesktop.vdesktop" not in result[2].data
+    assert sum((event.duration for event in result), timedelta()) == timedelta(
+        minutes=10
+    )
+
+
+def test_merge_subwatcher_fields_rejects_invalid_source_id():
+    with pytest.raises(ValueError, match="source_id"):
+        merge_subwatcher_fields([], [], [], source_id="invalid.source")

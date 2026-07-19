@@ -1,4 +1,5 @@
 import logging
+import re
 from abc import abstractmethod
 from datetime import datetime
 from typing import (
@@ -35,7 +36,7 @@ class QToken:
         raise NotImplementedError
 
 
-class QInteger(QToken):
+class QNumber(QToken):
     def __init__(self, value) -> None:
         self.value = value
 
@@ -44,17 +45,22 @@ class QInteger(QToken):
 
     @staticmethod
     def parse(string: str, namespace: dict) -> QToken:
-        return QInteger(int(string))
+        if "." in string or "e" in string.lower():
+            return QNumber(float(string))
+        return QNumber(int(string))
 
     @staticmethod
     def check(string: str):
-        token = ""
-        for char in string:
-            if char.isdigit():
-                token += char
-            else:
-                break
+        match = re.match(
+            r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?",
+            string,
+        )
+        token = match.group(0) if match else ""
         return token, string[len(token) :]
+
+
+# Compatibility for callers that imported the old internal token name.
+QInteger = QNumber
 
 
 class QVariable(QToken):
@@ -100,9 +106,25 @@ class QString(QToken):
     @staticmethod
     def parse(string: str, namespace: dict) -> "QString":
         quotes_type = string[0]
-        string = string.replace("\\" + quotes_type, quotes_type)
-        string = string[1:-1]
-        return QString(string)
+        value = string[1:-1]
+        decoded = ""
+        index = 0
+        while index < len(value):
+            if value[index] != "\\":
+                decoded += value[index]
+                index += 1
+                continue
+            end = index
+            while end < len(value) and value[end] == "\\":
+                end += 1
+            count = end - index
+            if end < len(value) and value[end] == quotes_type and count % 2 == 1:
+                decoded += "\\" * ((count - 1) // 2) + quotes_type
+                index = end + 1
+            else:
+                decoded += "\\" * count
+                index = end
+        return QString(decoded)
 
     @staticmethod
     def check(string: str):
@@ -111,14 +133,12 @@ class QString(QToken):
         if quotes_type != '"' and quotes_type != "'":
             return token, string
         token += quotes_type
-        prev_char = None
+        backslashes = 0
         for char in string[1:]:
             token += char
-            if (
-                char == quotes_type and prev_char != "\\"
-            ):  # escape quote_type with backslash
+            if char == quotes_type and backslashes % 2 == 0:
                 break
-            prev_char = char
+            backslashes = backslashes + 1 if char == "\\" else 0
         if token[-1] != quotes_type or len(token) < 2:
             # Unclosed string?
             raise QueryParseException("Failed to parse string")
@@ -163,9 +183,9 @@ class QFunction(QToken):
         args_str = string[arg_start + 1 : arg_end]
         while args_str:
             (arg_t, arg), args_str = _parse_token(args_str, namespace)
-            comma = args_str.find(",")
-            if comma != -1:
-                args_str = args_str[comma + 1 :]
+            args_str = args_str.lstrip()
+            if args_str.startswith(","):
+                args_str = args_str[1:]
             args.append(arg_t.parse(arg, namespace))
         return QFunction(name, args)
 
@@ -190,12 +210,13 @@ class QFunction(QToken):
         to_consume = 1
         single_quote = False
         double_quote = False
-        prev_char = None
+        backslashes = 0
         for char in string[i:]:
             i = i + 1
-            if char == "'" and prev_char != "\\" and not double_quote:
+            escaped = backslashes % 2 == 1
+            if char == "'" and not escaped and not double_quote:
                 single_quote = not single_quote
-            elif char == '"' and prev_char != "\\" and not single_quote:
+            elif char == '"' and not escaped and not single_quote:
                 double_quote = not double_quote
             elif single_quote or double_quote:
                 pass
@@ -207,7 +228,7 @@ class QFunction(QToken):
                 to_consume -= 1
             if to_consume == 0:
                 break
-            prev_char = char
+            backslashes = backslashes + 1 if char == "\\" else 0
         if to_consume != 0:
             return None, string
         return string[:i], string[i + 1 :]
@@ -259,12 +280,13 @@ class QDict(QToken):
         to_consume = 1
         single_quote = False
         double_quote = False
-        prev_char = None
+        backslashes = 0
         for char in string[i:]:
             i += 1
-            if char == "'" and prev_char != "\\" and not double_quote:
+            escaped = backslashes % 2 == 1
+            if char == "'" and not escaped and not double_quote:
                 single_quote = not single_quote
-            elif char == '"' and prev_char != "\\" and not single_quote:
+            elif char == '"' and not escaped and not single_quote:
                 double_quote = not double_quote
             elif single_quote or double_quote:
                 pass
@@ -274,7 +296,7 @@ class QDict(QToken):
                 to_consume = to_consume + 1
             if to_consume == 0:
                 break
-            prev_char = char
+            backslashes = backslashes + 1 if char == "\\" else 0
         return string[:i], string[i + 1 :]
 
 
@@ -314,12 +336,13 @@ class QList(QToken):
         to_consume = 1
         single_quote = False
         double_quote = False
-        prev_char = None
+        backslashes = 0
         for char in string[i:]:
             i += 1
-            if char == "'" and prev_char != "\\" and not double_quote:
+            escaped = backslashes % 2 == 1
+            if char == "'" and not escaped and not double_quote:
                 single_quote = not single_quote
-            elif char == '"' and prev_char != "\\" and not single_quote:
+            elif char == '"' and not escaped and not single_quote:
                 double_quote = not double_quote
             elif double_quote or single_quote:
                 pass
@@ -329,11 +352,11 @@ class QList(QToken):
                 to_consume = to_consume + 1
             if to_consume == 0:
                 break
-            prev_char = char
+            backslashes = backslashes + 1 if char == "\\" else 0
         return string[:i], string[i + 1 :]
 
 
-qtypes: Sequence[Type[QToken]] = [QString, QInteger, QFunction, QDict, QList, QVariable]
+qtypes: Sequence[Type[QToken]] = [QString, QNumber, QFunction, QDict, QList, QVariable]
 
 
 def _parse_token(string: str, namespace: dict) -> Tuple[Tuple[Any, str], str]:
@@ -362,6 +385,8 @@ def create_namespace() -> dict:
         "False": False,
         "true": True,
         "false": False,
+        "None": None,
+        "null": None,
     }
     return namespace
 
@@ -407,13 +432,14 @@ def _split_query_statements(query: str) -> List[str]:
     current = ""
     in_single_quote = False
     in_double_quote = False
-    prev_char = None
+    backslashes = 0
 
     for char in query:
-        if char == "'" and prev_char != "\\" and not in_double_quote:
+        escaped = backslashes % 2 == 1
+        if char == "'" and not escaped and not in_double_quote:
             in_single_quote = not in_single_quote
             current += char
-        elif char == '"' and prev_char != "\\" and not in_single_quote:
+        elif char == '"' and not escaped and not in_single_quote:
             in_double_quote = not in_double_quote
             current += char
         elif char == ";" and not in_single_quote and not in_double_quote:
@@ -421,7 +447,7 @@ def _split_query_statements(query: str) -> List[str]:
             current = ""
         else:
             current += char
-        prev_char = char
+        backslashes = backslashes + 1 if char == "\\" else 0
 
     if current:
         statements.append(current)

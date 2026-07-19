@@ -14,7 +14,10 @@ from aw_core.models import Event
 from aw_datastore import Datastore
 from aw_transform import (
     Rule,
+    active_periods_v2,
     categorize,
+    categorize_v2,
+    categorize_v2_explain,
     chunk_events_by_key,
     concat,
     filter_keyvals,
@@ -24,6 +27,7 @@ from aw_transform import (
     limit_events,
     merge_events_by_keys,
     merge_subwatcher_fields,
+    map_event_fields,
     period_union,
     simplify_string,
     sort_by_duration,
@@ -167,6 +171,22 @@ def q2_query_bucket(
 
 @q2_function()
 @q2_typecheck
+def q2_query_bucket_optional(
+    datastore: Datastore,
+    namespace: TNamespace,
+    bucketname: str,
+    expected_hostname: Optional[str] = None,
+) -> List[Event]:
+    buckets = datastore.buckets()
+    if bucketname not in buckets:
+        return []
+    if expected_hostname and buckets[bucketname].get("hostname") != expected_hostname:
+        return []
+    return q2_query_bucket(datastore, namespace, bucketname)
+
+
+@q2_function()
+@q2_typecheck
 def q2_query_bucket_eventcount(
     datastore: Datastore, namespace: TNamespace, bucketname: str
 ) -> int:
@@ -221,6 +241,8 @@ def q2_limit_events(events: list, count: int) -> List[Event]:
     Merge functions
 """
 
+_MISSING_SOURCE_ID = object()
+
 
 @q2_function(merge_events_by_keys)
 @q2_typecheck
@@ -231,10 +253,38 @@ def q2_merge_events_by_keys(events: list, keys: list) -> List[Event]:
 @q2_function(merge_subwatcher_fields)
 @q2_typecheck
 def q2_merge_subwatcher_fields(
-    base_events: list, subwatcher_events: list, keys: list, conflict: str = "base_wins"
+    base_events: list,
+    subwatcher_events: list,
+    keys: list,
+    conflict: str = "base_wins",
+    source_id: Any = _MISSING_SOURCE_ID,
 ) -> List[Event]:
     try:
-        return merge_subwatcher_fields(base_events, subwatcher_events, keys, conflict)
+        if isinstance(conflict, dict):
+            options = conflict
+            conflict = options.get("conflict", "base_wins")
+            if source_id is not _MISSING_SOURCE_ID and "source_id" in options:
+                raise QueryFunctionException(
+                    "source_id must be provided either in options or as the fifth argument, not both"
+                )
+            if source_id is _MISSING_SOURCE_ID:
+                source_id = options.get("source_id")
+        elif source_id is _MISSING_SOURCE_ID:
+            source_id = None
+        if source_id is not None and not isinstance(source_id, str):
+            raise QueryFunctionException("source_id must be a string")
+        return merge_subwatcher_fields(
+            base_events, subwatcher_events, keys, conflict, source_id
+        )
+    except ValueError as exc:
+        raise QueryFunctionException(str(exc)) from None
+
+
+@q2_function(map_event_fields)
+@q2_typecheck
+def q2_map_event_fields(events: list, mappings: dict) -> List[Event]:
+    try:
+        return map_event_fields(events, mappings)
     except ValueError as exc:
         raise QueryFunctionException(str(exc)) from None
 
@@ -335,6 +385,41 @@ def q2_nop():
 def q2_categorize(events: list, classes: list):
     classes = [(_cls, Rule(rule_dict)) for _cls, rule_dict in classes]
     return categorize(events, classes)
+
+
+@q2_function(categorize_v2)
+@q2_typecheck
+def q2_categorize_v2(
+    events: list, category_specs: list, host: Optional[str] = None
+):
+    try:
+        return categorize_v2(events, category_specs, host)
+    except (TypeError, ValueError) as exc:
+        raise QueryFunctionException(str(exc)) from None
+
+
+@q2_function(categorize_v2_explain)
+@q2_typecheck
+def q2_categorize_v2_explain(
+    events: list, category_specs: list, host: Optional[str] = None
+):
+    try:
+        return categorize_v2_explain(events, category_specs, host)
+    except (TypeError, ValueError) as exc:
+        raise QueryFunctionException(str(exc)) from None
+
+
+@q2_function(active_periods_v2)
+@q2_typecheck
+def q2_active_periods_v2(
+    named_sources: list,
+    expression_spec: dict,
+    host: Optional[str] = None,
+):
+    try:
+        return active_periods_v2(named_sources, expression_spec, host)
+    except (TypeError, ValueError) as exc:
+        raise QueryFunctionException(str(exc)) from None
 
 
 @q2_function(tag)

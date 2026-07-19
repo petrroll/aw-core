@@ -12,15 +12,30 @@ from .sort_by import (
 )
 from .split_url_events import split_url_events
 from .merge_subwatcher_fields import merge_subwatcher_fields
+from .map_event_fields import map_event_fields
 from .simplify import simplify_string
 from .flood import flood
 from .classify import categorize, tag, Rule
+from .rule_engine import (
+    categorize_v2,
+    categorize_v2_explain,
+    compile_category_rules,
+    compile_expression,
+)
+from .active_periods import active_periods_v2, compile_active_period_expression
 from .union_no_overlap import union_no_overlap
 
 __all__ = [
     "flood",
     "concat",
     "categorize",
+    "categorize_v2",
+    "categorize_v2_explain",
+    "compile_category_rules",
+    "compile_expression",
+    "active_periods_v2",
+    "map_event_fields",
+    "compile_active_period_expression",
     "tag",
     "Rule",
     "period_union",

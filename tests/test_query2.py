@@ -3,6 +3,7 @@ from typing import Any, Dict
 
 import iso8601
 import pytest
+from aw_datastore import Datastore
 from aw_core.models import Event
 from aw_datastore.storages import MemoryStorage
 from aw_query import query
@@ -16,6 +17,7 @@ from aw_query.query2 import (
     QFunction,
     QInteger,
     QList,
+    QNumber,
     QString,
     QVariable,
     _parse_token,
@@ -36,7 +38,11 @@ def test_query2_test_token_parsing():
     ns: Dict[str, Any] = {}
     (t, token), trash = _parse_token("123", ns)
     assert token == "123"
-    assert t == QInteger
+    assert t == QNumber
+    assert QInteger is QNumber
+    (t, token), trash = _parse_token("-1.5e2", ns)
+    assert token == "-1.5e2"
+    assert t == QNumber
     (t, token), trash = _parse_token('"test"', ns)
     assert token == '"test"'
     assert t == QString
@@ -75,6 +81,9 @@ def test_query2_test_token_parsing():
 
     with pytest.raises(QueryParseException):
         _parse_token("#", ns)
+
+    assert QString.parse(r'"\w+"', ns).interpret(mock_ds, ns) == r"\w+"
+    assert QString.parse(r'"a\\\"b"', ns).interpret(mock_ds, ns) == 'a\\"b'
 
 
 def test_dict():
@@ -216,6 +225,10 @@ def test_query2_return_value():
     result = query(qname, example_query, starttime, endtime, ds)
     assert result == 1
 
+    example_query = "RETURN = -1.5e2;"
+    result = query(qname, example_query, starttime, endtime, ds)
+    assert result == -150.0
+
     example_query = "RETURN = 'testing 123'"
     result = query(qname, example_query, starttime, endtime, ds)
     assert result == "testing 123"
@@ -352,6 +365,7 @@ def test_query2_function_in_function(datastore):
         bucket1 = datastore.create_bucket(
             bucket_id=bid, type="test", client="test", hostname="test", name="test"
         )
+
         # Prepare buckets
         e1 = Event(data={}, timestamp=starttime, duration=timedelta(seconds=1))
         bucket1.insert(e1)
@@ -359,6 +373,152 @@ def test_query2_function_in_function(datastore):
         assert 1 == len(result)
     finally:
         datastore.delete_bucket(bid)
+
+
+def test_query_bucket_optional_keeps_query_bucket_strict():
+    starttime = iso8601.parse_date("1970-01-01")
+    endtime = iso8601.parse_date("1970-01-02")
+
+    assert (
+        query(
+            "optional-missing-bucket",
+            'RETURN = query_bucket_optional("missing");',
+            starttime,
+            endtime,
+            mock_ds,
+        )
+        == []
+    )
+    with pytest.raises(QueryFunctionException, match="no bucket named"):
+        query(
+            "strict-missing-bucket",
+            'RETURN = query_bucket("missing");',
+            starttime,
+            endtime,
+            mock_ds,
+        )
+
+
+def test_query_bucket_optional_rejects_wrong_hostname():
+    starttime = iso8601.parse_date("1970-01-01")
+    endtime = iso8601.parse_date("1970-01-02")
+    bucket_id = "optional-hostname"
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    bucket = datastore.create_bucket(
+        bucket_id=bucket_id,
+        type="test",
+        client="test",
+        hostname="host-b",
+        name="test",
+    )
+    bucket.insert(Event(timestamp=starttime, duration=timedelta(seconds=1), data={}))
+    try:
+        assert query(
+            "optional-correct-hostname",
+            f'RETURN = query_bucket_optional("{bucket_id}", "host-b");',
+            starttime,
+            endtime,
+            datastore,
+        )
+        assert (
+            query(
+                "optional-wrong-hostname",
+                f'RETURN = query_bucket_optional("{bucket_id}", "host-a");',
+                starttime,
+                endtime,
+                datastore,
+            )
+            == []
+        )
+    finally:
+        datastore.delete_bucket(bucket_id)
+
+
+def test_query2_merge_subwatcher_fields_options_variable():
+    starttime = iso8601.parse_date("1970-01-01")
+    endtime = iso8601.parse_date("1970-01-02")
+    example_query = """
+    base = [];
+    context = [];
+    fields = ["vdesktop"];
+    options = {"source_id": "vdesktop", "conflict": "base_wins"};
+    RETURN = merge_subwatcher_fields(base, context, fields, options);
+    """
+
+    assert query("options", example_query, starttime, endtime, mock_ds) == []
+
+
+def test_query2_merge_subwatcher_fields_rejects_duplicate_source_id():
+    starttime = iso8601.parse_date("1970-01-01")
+    endtime = iso8601.parse_date("1970-01-02")
+    example_query = """
+    RETURN = merge_subwatcher_fields(
+        [],
+        [],
+        [],
+        {"source_id": "options"},
+        "positional"
+    );
+    """
+
+    with pytest.raises(QueryFunctionException, match="not both"):
+        query("duplicate-source-id", example_query, starttime, endtime, mock_ds)
+
+
+def test_query2_merge_subwatcher_fields_rejects_non_string_source_id():
+    starttime = iso8601.parse_date("1970-01-01")
+    endtime = iso8601.parse_date("1970-01-02")
+    example_query = """
+    RETURN = merge_subwatcher_fields([], [], [], {"source_id": 42});
+    """
+
+    with pytest.raises(QueryFunctionException, match="source_id must be a string"):
+        query("invalid-source-type", example_query, starttime, endtime, mock_ds)
+
+
+def test_query2_function_accepts_inline_dictionary_after_list():
+    starttime = iso8601.parse_date("1970-01-01")
+    endtime = iso8601.parse_date("1970-01-02")
+    example_query = """
+    base = [];
+    context = [];
+    RETURN = merge_subwatcher_fields(
+        base,
+        context,
+        ["vdesktop"],
+        {"source_id": "vdesktop", "conflict": "base_wins"}
+    );
+    """
+
+    assert query("inline-options", example_query, starttime, endtime, mock_ds) == []
+
+
+def test_query2_function_preserves_commas_inside_nested_arguments():
+    starttime = iso8601.parse_date("1970-01-01")
+    endtime = iso8601.parse_date("1970-01-02")
+    example_query = """
+    RETURN = nop(
+        ["first", {"nested": ["a", "b"]}],
+        {"first": "one", "second": "two"}
+    );
+    """
+
+    with pytest.raises(QueryInterpretException, match="invalid amount of arguments"):
+        query("nested-arguments", example_query, starttime, endtime, mock_ds)
+
+
+def test_query2_strings_can_end_with_an_even_number_of_backslashes():
+    starttime = iso8601.parse_date("1970-01-01")
+    endtime = iso8601.parse_date("1970-01-02")
+    example_query = r"""
+    value = {"regex": "path\\", "quoted": "a\"b"};
+    RETURN = value;
+    """
+
+    assert query("backslashes", example_query, starttime, endtime, mock_ds) == {
+        "regex": r"path\\",
+        "quoted": 'a"b',
+    }
 
 
 @pytest.mark.parametrize("datastore", param_datastore_objects())
@@ -612,3 +772,145 @@ def test_query2_query_categorize(datastore):
         assert result["events_by_cat"][1].duration == timedelta(seconds=2)
     finally:
         datastore.delete_bucket(bid)
+
+
+@pytest.mark.parametrize("datastore", param_datastore_objects())
+def test_query2_query_categorize_v2(datastore):
+    bid = "test_bucket_v2"
+    context_bid = "test_bucket_v2_context"
+    qname = "test"
+    starttime = iso8601.parse_date("1970")
+    endtime = starttime + timedelta(hours=1)
+    example_query = rf"""
+    events = query_bucket("{bid}");
+    context = query_bucket("{context_bid}");
+    events = merge_subwatcher_fields(events, context, ["vdesktop"], {{"source_id": "vdesktop"}});
+    events = map_event_fields(events, {{"title": "app"}});
+    category_specs = [
+        {{
+            "id": "work",
+            "name": ["Work"],
+            "rule": {{"type": "regex", "host": "test", "field": "app", "regex": "devenv"}}
+        }},
+        {{
+            "id": "personal",
+            "name": ["Personal"],
+            "rule": {{
+                "type": "all",
+                "rules": [
+                    {{"type": "regex", "field": "app", "regex": "devenv"}},
+                    {{"type": "regex", "source": "vdesktop", "field": "vdesktop", "regex": "Personal", "weight": 10}}
+                ]
+            }}
+        }}
+    ];
+    events = categorize_v2(events, category_specs, "test");
+    events = categorize_v2_explain(events, category_specs, "test");
+    RETURN = events;
+    """
+    try:
+        bucket = datastore.create_bucket(
+            bucket_id=bid, type="test", client="test", hostname="test", name="test"
+        )
+        context_bucket = datastore.create_bucket(
+            bucket_id=context_bid,
+            type="test.context",
+            client="test",
+            hostname="test",
+            name="context",
+        )
+        bucket.insert(
+            Event(
+                data={"app": "devenv.exe"},
+                timestamp=starttime,
+                duration=timedelta(seconds=1),
+            )
+        )
+        context_bucket.insert(
+            Event(
+                data={"vdesktop": "Personal"},
+                timestamp=starttime,
+                duration=timedelta(seconds=1),
+            )
+        )
+        result = query(qname, example_query, starttime, endtime, datastore)
+        assert result[0].data["$category"] == ["Personal"]
+        assert result[0].data["$category_score"] == 10
+        assert result[0].data["$category_explain"]["winner"] == "personal"
+    finally:
+        datastore.delete_bucket(bid)
+        datastore.delete_bucket(context_bid)
+
+
+@pytest.mark.parametrize("datastore", param_datastore_objects()[1:])
+def test_query2_active_periods_v2(datastore):
+    window_bid = "test_active_periods_window"
+    afk_bid = "test_active_periods_afk"
+    starttime = iso8601.parse_date("1970")
+    endtime = starttime + timedelta(hours=1)
+    code = rf"""
+    window = query_bucket("{window_bid}");
+    afk = query_bucket("{afk_bid}");
+    active_rule = {{
+        "type": "all",
+        "rules": [
+            {{"type": "regex", "source": "window", "field": "app", "regex": "Teams"}},
+            {{"type": "regex", "source": "afk", "host": "test", "field": "status", "regex": "not-afk"}}
+        ]
+    }};
+    active_sources = [["window", window], ["afk", afk]];
+    RETURN = active_periods_v2(active_sources, active_rule, "test");
+    """
+    try:
+        window = datastore.create_bucket(
+            bucket_id=window_bid,
+            type="test.window",
+            client="test",
+            hostname="test",
+            name="window",
+        )
+        afk = datastore.create_bucket(
+            bucket_id=afk_bid,
+            type="test.afk",
+            client="test",
+            hostname="test",
+            name="afk",
+        )
+        window.insert(
+            Event(
+                timestamp=starttime,
+                duration=timedelta(minutes=10),
+                data={"app": "Teams"},
+            )
+        )
+        afk.insert(
+            Event(
+                timestamp=starttime + timedelta(minutes=2),
+                duration=timedelta(minutes=3),
+                data={"status": "not-afk"},
+            )
+        )
+
+        result = query("active-periods", code, starttime, endtime, datastore)
+        assert len(result) == 1
+        assert result[0].timestamp == starttime + timedelta(minutes=2)
+        assert result[0].duration == timedelta(minutes=3)
+    finally:
+        if window_bid in datastore.buckets():
+            datastore.delete_bucket(window_bid)
+        if afk_bid in datastore.buckets():
+            datastore.delete_bucket(afk_bid)
+
+
+@pytest.mark.parametrize("datastore", param_datastore_objects()[1:])
+def test_query2_signed_integer_and_null_literals(datastore):
+    starttime = iso8601.parse_date("1970")
+    result = query(
+        "literals",
+        'RETURN = {"negative": -1, "nothing": null};',
+        starttime,
+        starttime + timedelta(seconds=1),
+        datastore,
+    )
+
+    assert result == {"negative": -1, "nothing": None}
