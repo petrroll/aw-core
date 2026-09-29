@@ -1,4 +1,5 @@
 import logging
+from copy import deepcopy
 from datetime import timedelta
 from typing import List
 
@@ -14,6 +15,7 @@ def chunk_events_by_key(
     "Chunks" adjacent events together which have the same value for a key, and stores the
     original events in the :code:`subevents` key of the new event.
     """
+    events = deepcopy(events)
     chunked_events: List[Event] = []
     for event in events:
         if key not in event.data:

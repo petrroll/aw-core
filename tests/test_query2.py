@@ -399,6 +399,378 @@ def test_query_bucket_optional_keeps_query_bucket_strict():
         )
 
 
+@pytest.mark.parametrize("datastore", param_datastore_objects())
+def test_query_bucket_optional_raw_preserves_origins_and_strict_boundaries(datastore):
+    bucket_id = "optional-raw-boundaries"
+    query_start = iso8601.parse_date("2000-01-03T00:00:10Z")
+    query_end = query_start + timedelta(seconds=50)
+    bucket = datastore.create_bucket(
+        bucket_id=bucket_id,
+        type="test",
+        client="test",
+        hostname="host-a",
+        name="test",
+    )
+    old_start = query_start - timedelta(days=2)
+    newer_start = query_start - timedelta(seconds=5)
+    bucket.insert(
+        [
+            Event(
+                timestamp=old_start,
+                duration=timedelta(days=3),
+                data={"name": "old"},
+            ),
+            Event(
+                timestamp=newer_start,
+                duration=timedelta(seconds=25),
+                data={"name": "new"},
+            ),
+            Event(
+                timestamp=query_start - timedelta(seconds=10),
+                duration=timedelta(seconds=10),
+                data={"name": "left-touch"},
+            ),
+            Event(
+                timestamp=query_end,
+                duration=timedelta(seconds=10),
+                data={"name": "right-touch"},
+            ),
+        ]
+    )
+    try:
+        raw = query(
+            "raw-origins",
+            f'RETURN = query_bucket_optional_raw("{bucket_id}", "host-a");',
+            query_start,
+            query_end,
+            datastore,
+        )
+        by_name = {event.data["name"]: event for event in raw}
+        assert set(by_name) == {"old", "new"}
+        assert by_name["old"].timestamp == old_start
+        assert by_name["old"].duration == timedelta(days=3)
+        assert by_name["new"].timestamp == newer_start
+        assert by_name["new"].duration == timedelta(seconds=25)
+        assert (
+            query(
+                "raw-owner-mismatch",
+                f'RETURN = query_bucket_optional_raw("{bucket_id}", "host-b");',
+                query_start,
+                query_end,
+                datastore,
+            )
+            == []
+        )
+    finally:
+        datastore.delete_bucket(bucket_id)
+
+
+@pytest.mark.parametrize("datastore", param_datastore_objects())
+def test_query_bucket_optional_raw_has_deterministic_fact_order(datastore):
+    bucket_id = "optional-raw-ties"
+    later_bucket_id = "optional-raw-ties-later"
+    start = iso8601.parse_date("2000-01-03T00:00:00Z")
+    bucket = datastore.create_bucket(
+        bucket_id=bucket_id,
+        type="test",
+        client="test",
+        hostname="host-a",
+        name="test",
+    )
+    later_bucket = datastore.create_bucket(
+        bucket_id=later_bucket_id,
+        type="test",
+        client="test",
+        hostname="host-a",
+        name="test",
+    )
+    bucket.insert(
+        [
+            Event(timestamp=start, duration=30, data={"name": "first"}),
+            Event(timestamp=start, duration=30, data={"name": "second"}),
+        ]
+    )
+    later_bucket.insert(
+        Event(timestamp=start, duration=30, data={"name": "later-bucket"})
+    )
+    try:
+        result = query(
+            "raw-tie-order",
+            f'''
+                raw = query_bucket_optional_raw("{bucket_id}", "host-a");
+                RETURN = merge_subwatcher_fields(query_period(), raw, ["name"]);
+            ''',
+            start,
+            start + timedelta(seconds=30),
+            datastore,
+        )
+        assert len(result) == 1
+        assert result[0].data["name"] == "second"
+
+        raw = query(
+            "raw-order",
+            f'RETURN = query_bucket_optional_raw("{bucket_id}", "host-a");',
+            start,
+            start + timedelta(seconds=30),
+            datastore,
+        )
+        assert [event.data["name"] for event in raw] == ["first", "second"]
+        assert [event.id for event in raw] == sorted(event.id for event in raw)
+
+        result = query(
+            "raw-bucket-order",
+            f'''
+                first = query_bucket_optional_raw("{bucket_id}", "host-a");
+                later = query_bucket_optional_raw("{later_bucket_id}", "host-a");
+                raw = concat(first, later);
+                RETURN = merge_subwatcher_fields(query_period(), raw, ["name"]);
+            ''',
+            start,
+            start + timedelta(seconds=30),
+            datastore,
+        )
+        assert result[0].data["name"] == "later-bucket"
+    finally:
+        datastore.delete_bucket(bucket_id)
+        datastore.delete_bucket(later_bucket_id)
+
+
+@pytest.mark.parametrize("datastore", param_datastore_objects())
+def test_query_bucket_optional_raw_padding_captures_heartbeat_neighbors(datastore):
+    bucket_id = "optional-raw-padding"
+    origin = iso8601.parse_date("2000-01-03T00:00:00Z")
+    query_start = origin + timedelta(seconds=12)
+    query_end = origin + timedelta(seconds=13)
+    bucket = datastore.create_bucket(
+        bucket_id=bucket_id,
+        type="test",
+        client="test",
+        hostname="host-a",
+        name="test",
+    )
+    bucket.insert(
+        [
+            Event(
+                timestamp=origin,
+                duration=timedelta(seconds=10),
+                data={"name": "left"},
+            ),
+            Event(
+                timestamp=origin + timedelta(seconds=14),
+                duration=timedelta(seconds=10),
+                data={"name": "right"},
+            ),
+        ]
+    )
+    try:
+        # The original interval is wholly inside the heartbeat gap.
+        assert query(
+            "raw-padding-default",
+            f'RETURN = query_bucket_optional_raw("{bucket_id}", null, 0);',
+            query_start,
+            query_end,
+            datastore,
+        ) == []
+
+        raw = query(
+            "raw-padding-neighbors",
+            f'RETURN = query_bucket_optional_raw("{bucket_id}", null, 5);',
+            query_start,
+            query_end,
+            datastore,
+        )
+        by_name = {event.data["name"]: event for event in raw}
+        assert set(by_name) == {"left", "right"}
+        assert by_name["left"].timestamp == origin
+        assert by_name["left"].duration == timedelta(seconds=10)
+        assert by_name["right"].timestamp == origin + timedelta(seconds=14)
+        assert by_name["right"].duration == timedelta(seconds=10)
+
+        # Fractional padding is rounded consistently to microseconds. An event
+        # beginning exactly at the padded end does not overlap; one microsecond
+        # more includes it without changing its origin.
+        assert query(
+            "raw-padding-right-boundary",
+            f'RETURN = query_bucket_optional_raw("{bucket_id}", null, 1);',
+            query_start,
+            query_end,
+            datastore,
+        ) == []
+        right = query(
+            "raw-padding-right-microsecond",
+            f'RETURN = query_bucket_optional_raw("{bucket_id}", null, 1.000001);',
+            query_start,
+            query_end,
+            datastore,
+        )
+        assert len(right) == 1
+        assert right[0].timestamp == origin + timedelta(seconds=14)
+        assert right[0].duration == timedelta(seconds=10)
+
+        assert query(
+            "raw-padding-owner-mismatch",
+            f'RETURN = query_bucket_optional_raw("{bucket_id}", "host-b", 5);',
+            query_start,
+            query_end,
+            datastore,
+        ) == []
+
+        # Padded facts allow flood_v2 to fill the gap, while query_period stays
+        # on the unpadded caller interval and bounds the final mask.
+        bounded = query(
+            "raw-padding-bounded-heartbeat",
+            f'''
+                raw = query_bucket_optional_raw("{bucket_id}", null, 5);
+                flooded = flood_v2(raw, 5);
+                RETURN = filter_period_intersect(flooded, query_period());
+            ''',
+            query_start,
+            query_end,
+            datastore,
+        )
+        assert len(bounded) == 1
+        assert bounded[0].timestamp == query_start
+        assert bounded[0].duration == timedelta(seconds=1)
+        assert bounded[0].data == {"name": "left"}
+
+        assert query(
+            "raw-padding-empty-interval",
+            f'RETURN = query_bucket_optional_raw("{bucket_id}", null, 5);',
+            query_start,
+            query_start,
+            datastore,
+        ) == []
+
+        for literal in ("-1", "3600.000001", "null", '"5"', "true", "1e309"):
+            with pytest.raises(QueryFunctionException, match="padding_seconds"):
+                query(
+                    "raw-padding-invalid",
+                    f'RETURN = query_bucket_optional_raw("{bucket_id}", null, {literal});',
+                    query_start,
+                    query_end,
+                    datastore,
+                )
+        with pytest.raises(QueryFunctionException, match="expected_hostname"):
+            query(
+                "raw-padding-invalid-hostname",
+                f'RETURN = query_bucket_optional_raw("{bucket_id}", 5, 5);',
+                query_start,
+                query_end,
+                datastore,
+            )
+    finally:
+        datastore.delete_bucket(bucket_id)
+
+
+@pytest.mark.parametrize("datastore", param_datastore_objects())
+def test_raw_context_precedence_and_query_period_bound_output(datastore):
+    bucket_id = "optional-raw-context"
+    query_start = iso8601.parse_date("2001-01-01T00:00:30Z")
+    query_end = query_start + timedelta(seconds=70)
+    origin = query_start - timedelta(seconds=30)
+    bucket = datastore.create_bucket(
+        bucket_id=bucket_id,
+        type="test",
+        client="test",
+        hostname="host-a",
+        name="test",
+    )
+    bucket.insert(
+        [
+            Event(
+                timestamp=origin,
+                duration=timedelta(seconds=100),
+                data={"name": "old"},
+            ),
+            Event(
+                timestamp=origin + timedelta(seconds=20),
+                duration=timedelta(seconds=60),
+                data={"name": "new"},
+            ),
+        ]
+    )
+    code = f'''
+        coverage = query_period();
+        context = query_bucket_optional_raw("{bucket_id}", "host-a");
+        RETURN = merge_subwatcher_fields(coverage, context, ["name"]);
+    '''
+    try:
+        result = query(
+            "raw-context-precedence", code, query_start, query_end, datastore
+        )
+        assert [(event.timestamp, event.duration, event.data["name"]) for event in result] == [
+            (query_start, timedelta(seconds=50), "new"),
+            (query_start + timedelta(seconds=50), timedelta(seconds=20), "old"),
+        ]
+        assert sum((event.duration for event in result), timedelta()) == query_end - query_start
+    finally:
+        datastore.delete_bucket(bucket_id)
+
+
+@pytest.mark.parametrize("datastore", param_datastore_objects())
+def test_query2_transforms_leave_reused_variables_unchanged(datastore):
+    bucket_id = "transform-purity"
+    start = iso8601.parse_date("2002-01-01T00:00:00Z")
+    bucket = datastore.create_bucket(
+        bucket_id=bucket_id,
+        type="test",
+        client="test",
+        hostname="host-a",
+        name="test",
+    )
+    bucket.insert(
+        Event(
+            timestamp=start,
+            duration=timedelta(seconds=10),
+            data={
+                "owner": "high",
+                "label": "match",
+                "url": "https://example.test/path",
+            },
+        )
+    )
+    try:
+        result = query(
+            "transform-purity",
+            f'''
+                events = query_bucket("{bucket_id}");
+                coverage = period_union([], events);
+                mapped = map_event_fields(events, {{"copy": "label"}});
+                urls = split_url_events(events);
+                categorized = categorize(events, [[["Category"], {{"regex": "match"}}]]);
+                tagged = tag(events, [["tag", {{"regex": "match"}}]]);
+                RETURN = {{"events": events, "coverage": coverage}};
+            ''',
+            start,
+            start + timedelta(seconds=10),
+            datastore,
+        )
+
+        assert result["events"][0].data == {
+            "owner": "high",
+            "label": "match",
+            "url": "https://example.test/path",
+        }
+        assert result["coverage"][0].data == {}
+    finally:
+        datastore.delete_bucket(bucket_id)
+
+
+def test_query_period_is_exact_and_empty_interval_is_empty():
+    starttime = iso8601.parse_date("2002-01-01T00:00:00Z")
+    endtime = starttime + timedelta(seconds=10)
+    period = query(
+        "query-period", "RETURN = query_period();", starttime, endtime, mock_ds
+    )
+    assert len(period) == 1
+    assert period[0].timestamp == starttime
+    assert period[0].duration == timedelta(seconds=10)
+    assert period[0].data == {}
+    assert query(
+        "query-period-empty", "RETURN = query_period();", starttime, starttime, mock_ds
+    ) == []
+
+
 def test_query_bucket_optional_rejects_wrong_hostname():
     starttime = iso8601.parse_date("1970-01-01")
     endtime = iso8601.parse_date("1970-01-02")
@@ -521,6 +893,18 @@ def test_query2_strings_can_end_with_an_even_number_of_backslashes():
     }
 
 
+def test_legacy_categorize_reports_invalid_rules_as_query_errors():
+    start = iso8601.parse_date("1970-01-01")
+    with pytest.raises(QueryFunctionException):
+        query(
+            "invalid-legacy-category",
+            'events = []; RETURN = categorize(events, [[["Category"], {"regex": ["invalid"]}]]);',
+            start,
+            start + timedelta(seconds=1),
+            mock_ds,
+        )
+
+
 @pytest.mark.parametrize("datastore", param_datastore_objects())
 def test_query2_query_functions(datastore):
     """
@@ -571,6 +955,56 @@ def test_query2_query_functions(datastore):
         assert result["events"][0].data["$category"] == ["test", "subtest"]
     finally:
         datastore.delete_bucket(bid)
+
+
+@pytest.mark.parametrize("datastore", param_datastore_objects())
+def test_query2_union_no_overlap_suppresses_all_covered_lower_events(datastore):
+    start = iso8601.parse_date("2024-01-01T00:00:00Z")
+    high_id = "union-high"
+    low_id = "union-low"
+    high = datastore.create_bucket(
+        bucket_id=high_id,
+        type="test",
+        client="test",
+        hostname="host",
+        name="high",
+    )
+    low = datastore.create_bucket(
+        bucket_id=low_id,
+        type="test",
+        client="test",
+        hostname="host",
+        name="low",
+    )
+    high.insert(Event(timestamp=start, duration=60, data={"owner": "high"}))
+    low.insert(
+        [
+            Event(
+                timestamp=start + timedelta(seconds=offset),
+                duration=20,
+                data={"owner": "low"},
+            )
+            for offset in (0, 20, 40)
+        ]
+    )
+    try:
+        result = query(
+            "union-precedence",
+            f'''
+                high = query_bucket("{high_id}");
+                low = query_bucket("{low_id}");
+                RETURN = union_no_overlap(high, low);
+            ''',
+            start,
+            start + timedelta(seconds=60),
+            datastore,
+        )
+        assert [(event.duration, event.data["owner"]) for event in result] == [
+            (timedelta(seconds=60), "high")
+        ]
+    finally:
+        datastore.delete_bucket(high_id)
+        datastore.delete_bucket(low_id)
 
 
 @pytest.mark.parametrize("datastore", param_datastore_objects())

@@ -1,6 +1,7 @@
 import logging
-from typing import List
 import re
+from copy import deepcopy
+from typing import List
 
 from aw_core.models import Event
 
@@ -14,9 +15,8 @@ def filter_keyvals(
         return key in event.data and event.data[key] in vals
 
     if exclude:
-        return [e for e in events if not predicate(e)]
-    else:
-        return [e for e in events if predicate(e)]
+        return [deepcopy(event) for event in events if not predicate(event)]
+    return [deepcopy(event) for event in events if predicate(event)]
 
 
 def filter_keyvals_regex(events: List[Event], key: str, regex: str) -> List[Event]:
@@ -25,4 +25,4 @@ def filter_keyvals_regex(events: List[Event], key: str, regex: str) -> List[Even
     def predicate(event):
         return key in event.data and bool(r.findall(event.data[key]))
 
-    return [e for e in events if predicate(e)]
+    return [deepcopy(event) for event in events if predicate(event)]

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from aw_core import Event
 
 from .filter_period_intersect import filter_period_intersect, period_union
+from .merge_subwatcher_fields import resolve_source_facts
 from .rule_engine import (
     MAX_EXPRESSION_DEPTH,
     MAX_EXPRESSION_NODES,
@@ -167,8 +168,7 @@ def active_periods_v2(
             raise ValueError(
                 f"active period source {source_id!r} events must be an event list"
             )
-        sources[source_id] = events
+        sources[source_id] = resolve_source_facts(events)
 
-    return compile_active_period_expression(expression_spec).evaluate(
-        sources, host
-    )
+    periods = compile_active_period_expression(expression_spec).evaluate(sources, host)
+    return period_union([], periods)

@@ -1,3 +1,5 @@
+import math
+import re
 from datetime import timedelta
 from functools import wraps
 from inspect import signature
@@ -7,6 +9,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
 )
 
 import iso8601
@@ -24,6 +27,7 @@ from aw_transform import (
     filter_keyvals_regex,
     filter_period_intersect,
     flood,
+    flood_v2,
     limit_events,
     merge_events_by_keys,
     merge_subwatcher_fields,
@@ -158,6 +162,7 @@ def q2_find_bucket(
 def q2_query_bucket(
     datastore: Datastore, namespace: TNamespace, bucketname: str
 ) -> List[Event]:
+    """Fetch events with the legacy Query2 clipping and ordering contract."""
     _verify_bucket_exists(datastore, bucketname)
     try:
         starttime = iso8601.parse_date(namespace["STARTTIME"])
@@ -177,12 +182,111 @@ def q2_query_bucket_optional(
     bucketname: str,
     expected_hostname: Optional[str] = None,
 ) -> List[Event]:
+    """Optionally fetch events using the legacy clipped bucket read."""
     buckets = datastore.buckets()
     if bucketname not in buckets:
         return []
     if expected_hostname and buckets[bucketname].get("hostname") != expected_hostname:
         return []
     return q2_query_bucket(datastore, namespace, bucketname)
+
+
+@q2_function()
+@q2_typecheck
+def q2_query_bucket_optional_raw(
+    datastore: Datastore,
+    namespace: TNamespace,
+    bucketname: str,
+    expected_hostname: Optional[str] = None,
+    padding_seconds: float = 0,
+) -> List[Event]:
+    """Fetch overlapping source records without clipping their stored bounds.
+
+    ``padding_seconds`` expands only the datastore lookup interval on both
+    sides. It accepts finite values from 0 through 3600 seconds, at microsecond
+    precision. The original query interval and returned event bounds are never
+    changed. Passing ``null`` for ``expected_hostname`` allows callers to use
+    padding without applying a hostname check.
+    """
+    if expected_hostname is not None and not isinstance(expected_hostname, str):
+        raise QueryFunctionException(
+            "query_bucket_optional_raw expected_hostname must be a string or null"
+        )
+    if (
+        isinstance(padding_seconds, bool)
+        or not isinstance(padding_seconds, (int, float))
+        or padding_seconds < 0
+        or padding_seconds > 3600
+        or not math.isfinite(padding_seconds)
+    ):
+        raise QueryFunctionException(
+            "query_bucket_optional_raw padding_seconds must be a finite number "
+            "between 0 and 3600"
+        )
+    # Round half-up once to the common Python/Rust microsecond precision.
+    padding_microseconds = math.floor(padding_seconds * 1_000_000 + 0.5)
+    padding = timedelta(microseconds=padding_microseconds)
+
+    try:
+        starttime = iso8601.parse_date(namespace["STARTTIME"])
+        endtime = iso8601.parse_date(namespace["ENDTIME"])
+    except iso8601.ParseError:
+        raise QueryFunctionException(
+            "Unable to parse starttime/endtime for query_bucket_optional_raw"
+        ) from None
+    # Padding must not turn an empty/reversed caller interval into a data load.
+    if endtime <= starttime:
+        return []
+
+    buckets = datastore.buckets()
+    if bucketname not in buckets:
+        return []
+    if (
+        expected_hostname is not None
+        and buckets[bucketname].get("hostname") != expected_hostname
+    ):
+        return []
+
+    try:
+        lookup_start = starttime - padding
+        lookup_end = endtime + padding
+    except OverflowError:
+        raise QueryFunctionException(
+            "query_bucket_optional_raw padding exceeds the supported datetime range"
+        ) from None
+    events = datastore[bucketname].get_unclipped(
+        starttime=lookup_start, endtime=lookup_end
+    )
+    overlapping = [
+        event
+        for event in events
+        if event.timestamp < lookup_end
+        and event.timestamp + event.duration > lookup_start
+    ]
+    insertion_order = {id(event): index for index, event in enumerate(overlapping)}
+    return sorted(
+        overlapping,
+        key=lambda event: (
+            event.timestamp,
+            event.timestamp + event.duration,
+            event.id if event.id is not None else insertion_order[id(event)],
+        ),
+    )
+
+
+@q2_function()
+def q2_query_period(namespace: TNamespace) -> List[Event]:
+    """Return a blank event exactly bounding the non-empty query interval."""
+    try:
+        starttime = iso8601.parse_date(namespace["STARTTIME"])
+        endtime = iso8601.parse_date(namespace["ENDTIME"])
+    except iso8601.ParseError:
+        raise QueryFunctionException(
+            "Unable to parse starttime/endtime for query_period"
+        ) from None
+    if endtime <= starttime:
+        return []
+    return [Event(timestamp=starttime, duration=endtime - starttime, data={})]
 
 
 @q2_function()
@@ -343,7 +447,17 @@ def q2_union_no_overlap(events1: list, events2: list) -> List[Event]:
 @q2_function(flood)
 @q2_typecheck
 def q2_flood(events: list) -> List[Event]:
+    """Apply the legacy Query2 heartbeat transform."""
     return flood(events)
+
+
+@q2_function(flood_v2)
+@q2_typecheck
+def q2_flood_v2(events: list, threshold_seconds: float = 5) -> List[Event]:
+    try:
+        return flood_v2(events, threshold_seconds)
+    except ValueError as exc:
+        raise QueryFunctionException(str(exc)) from None
 
 
 """
@@ -380,11 +494,17 @@ def q2_nop():
 """
 
 
+def _compile_legacy_rules(classes: list) -> List[Tuple[Any, Rule]]:
+    try:
+        return [(_cls, Rule(rule_dict)) for _cls, rule_dict in classes]
+    except (re.error, TypeError, ValueError) as exc:
+        raise QueryFunctionException(str(exc)) from None
+
+
 @q2_function(categorize)
 @q2_typecheck
 def q2_categorize(events: list, classes: list):
-    classes = [(_cls, Rule(rule_dict)) for _cls, rule_dict in classes]
-    return categorize(events, classes)
+    return categorize(events, _compile_legacy_rules(classes))
 
 
 @q2_function(categorize_v2)
@@ -425,5 +545,5 @@ def q2_active_periods_v2(
 @q2_function(tag)
 @q2_typecheck
 def q2_tag(events: list, classes: list):
-    classes = [(_cls, Rule(rule_dict)) for _cls, rule_dict in classes]
-    return tag(events, classes)
+    """Run the legacy Query2 tag API with client-safe input errors."""
+    return tag(events, _compile_legacy_rules(classes))

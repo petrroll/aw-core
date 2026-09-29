@@ -1,5 +1,7 @@
-from pprint import pprint
+import re
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from pprint import pprint
 
 import pytest
 from aw_core.models import Event
@@ -24,6 +26,10 @@ from aw_transform import (
     categorize,
     categorize_v2,
     categorize_v2_explain,
+    concat,
+    flood,
+    flood_v2,
+    limit_events,
     tag,
     Rule,
 )
@@ -44,6 +50,112 @@ def test_map_event_fields_reads_all_values_before_writing_targets():
 
     assert result.data["app"] == "Teams"
     assert result.data["title"] == "Original"
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        lambda events, other: filter_keyvals(events, "label", ["match"]),
+        lambda events, other: filter_keyvals(
+            events, "label", ["match"], exclude=True
+        ),
+        lambda events, other: filter_keyvals_regex(events, "label", "match"),
+        lambda events, other: filter_period_intersect(events, other),
+        lambda events, other: period_union(events, other),
+        lambda events, other: limit_events(events, 1),
+        lambda events, other: merge_events_by_keys(events, ["label"]),
+        lambda events, other: merge_events_by_keys(events, []),
+        lambda events, other: merge_subwatcher_fields(
+            events, other, ["project"]
+        ),
+        lambda events, other: map_event_fields(events, {"copy": "label"}),
+        lambda events, other: chunk_events_by_key(events, "label"),
+        lambda events, other: sort_by_timestamp(events),
+        lambda events, other: sort_by_duration(events),
+        lambda events, other: concat(events, other),
+        lambda events, other: union(events, other),
+        lambda events, other: union_no_overlap(events, other),
+        lambda events, other: flood(events),
+        lambda events, other: flood_v2(events),
+        lambda events, other: split_url_events(events),
+        lambda events, other: simplify_string(events, "title"),
+        lambda events, other: categorize(
+            events, [(["Matched"], Rule({"regex": "match"}))]
+        ),
+        lambda events, other: categorize_v2(
+            events,
+            [{"name": ["Matched"], "rule": {"type": "regex", "regex": "match"}}],
+        ),
+        lambda events, other: categorize_v2_explain(
+            events,
+            [{"name": ["Matched"], "rule": {"type": "regex", "regex": "match"}}],
+        ),
+        lambda events, other: tag(
+            events, [("matched", Rule({"regex": "match"}))]
+        ),
+        lambda events, other: active_periods_v2(
+            [["source", events]],
+            {
+                "type": "regex",
+                "source": "source",
+                "field": "label",
+                "regex": "match",
+            },
+        ),
+    ],
+)
+def test_event_transforms_do_not_alias_or_mutate_inputs(transform):
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    events = [
+        Event(
+            timestamp=start,
+            duration=timedelta(seconds=2),
+            data={
+                "app": "Editor",
+                "title": "match",
+                "label": "match",
+                "url": "https://example.test/path",
+                "nested": {"value": 1},
+            },
+        ),
+        Event(
+            timestamp=start + timedelta(seconds=3),
+            duration=timedelta(seconds=2),
+            data={
+                "app": "Browser",
+                "title": "other",
+                "label": "other",
+                "url": "https://other.test/",
+                "nested": {"value": 2},
+            },
+        ),
+    ]
+    other = [
+        Event(
+            timestamp=start + timedelta(seconds=1),
+            duration=timedelta(seconds=3),
+            data={"project": "activitywatch", "nested": {"value": 3}},
+        )
+    ]
+    original_events = deepcopy(events)
+    original_other = deepcopy(other)
+    input_ids = {id(event) for event in events + other}
+
+    result = transform(events, other)
+
+    assert events == original_events
+    assert other == original_other
+    assert all(id(event) not in input_ids for event in result)
+    if result:
+        result[0].data["result-only"] = True
+        nested = result[0].data.get("nested")
+        if nested:
+            nested["value"] = "result-only"
+        subevents = result[0].data.get("subevents", [])
+        if subevents:
+            subevents[0].data["result-only"] = True
+        assert events == original_events
+        assert other == original_other
 
 
 def test_simplify_string():
@@ -170,6 +282,106 @@ def test_active_periods_v2_unions_and_negates_rules():
     assert len(result) == 1
     assert result[0].timestamp == start
     assert result[0].duration == timedelta(minutes=4)
+
+
+def test_active_periods_v2_matches_only_winning_source_facts():
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    sources = [
+        [
+            "status",
+            [
+                Event(
+                    timestamp=start,
+                    duration=timedelta(seconds=30),
+                    data={"state": "on"},
+                ),
+                Event(
+                    timestamp=start + timedelta(seconds=10),
+                    duration=timedelta(seconds=10),
+                    data={"state": "off"},
+                ),
+            ],
+        ]
+    ]
+    on = {
+        "type": "regex",
+        "source": "status",
+        "field": "state",
+        "regex": "^on$",
+    }
+    off = {**on, "regex": "^off$"}
+
+    result = active_periods_v2(sources, on)
+    assert [(event.timestamp, event.duration) for event in result] == [
+        (start, timedelta(seconds=10)),
+        (start + timedelta(seconds=20), timedelta(seconds=10)),
+    ]
+    assert active_periods_v2(
+        sources, {"type": "all", "rules": [on, off]}
+    ) == []
+    negated_off = {**off, "negate": True}
+    assert [event.duration for event in active_periods_v2(sources, negated_off)] == [
+        timedelta(seconds=10),
+        timedelta(seconds=10),
+    ]
+
+    enriched = merge_subwatcher_fields(
+        [Event(timestamp=start, duration=timedelta(seconds=30), data={})],
+        sources[0][1],
+        ["state"],
+        source_id="status",
+    )
+    categorized = categorize_v2(
+        enriched,
+        [
+            {
+                "name": ["On"],
+                "rule": {
+                    "type": "regex",
+                    "source": "status",
+                    "field": "state",
+                    "regex": "^on$",
+                },
+            }
+        ],
+    )
+    assert [event.data["$category"] for event in categorized] == [
+        ["On"],
+        ["Uncategorized"],
+        ["On"],
+    ]
+
+
+def test_active_periods_v2_exact_tie_uses_later_source_record():
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    sources = [
+        [
+            "status",
+            [
+                Event(timestamp=start, duration=10, data={"state": "first"}),
+                Event(timestamp=start, duration=10, data={"state": "second"}),
+            ],
+        ]
+    ]
+
+    assert active_periods_v2(
+        sources,
+        {
+            "type": "regex",
+            "source": "status",
+            "field": "state",
+            "regex": "^second$",
+        },
+    )
+    assert not active_periods_v2(
+        sources,
+        {
+            "type": "regex",
+            "source": "status",
+            "field": "state",
+            "regex": "^first$",
+        },
+    )
 
 
 def test_active_periods_v2_rejects_unknown_sources():
@@ -576,6 +788,43 @@ def test_categorize():
     assert events[3].data["$category"] == ["Uncategorized"]
 
 
+def test_legacy_categorize_uses_v2_pipeline_and_projects_old_shape():
+    events = [
+        Event(data={"$source.context.name": "match"}),
+        Event(
+            data={
+                "title": "match",
+                "$category_score": 99,
+                "$category_rule": "preexisting",
+            }
+        ),
+    ]
+    classes = [
+        (["First"], Rule({"regex": "match"})),
+        (["Later"], Rule({"regex": "match"})),
+    ]
+
+    result = categorize(events, classes)
+
+    assert result[0].data["$category"] == ["Later"]
+    assert "$category_score" not in result[0].data
+    assert "$category_rule" not in result[0].data
+    assert result[1].data["$category"] == ["Later"]
+    assert result[1].data["$category_score"] == 99
+    assert result[1].data["$category_rule"] == "preexisting"
+
+
+def test_legacy_categorize_preserves_schema_inputs_outside_v2_budgets():
+    classes = [
+        ([f"Category {index}"], Rule({"regex": "x" * 4097 if index == 0 else "match"}))
+        for index in range(1001)
+    ]
+
+    result = categorize([Event(data={"title": "match"})], classes)
+
+    assert result[0].data["$category"] == ["Category 1000"]
+
+
 def test_categorize_v2_nested_rules_and_scores():
     event = Event(
         data={
@@ -751,6 +1000,72 @@ def test_categorize_v2_weight_zero_preserves_depth_and_last_wins():
     assert result.data["$category"] == ["Last", "Deep"]
 
 
+def test_categorize_v2_set_priority_ranks_after_category_depth():
+    categories = [
+        {
+            "id": "high-set-shallow",
+            "name": ["Shallow"],
+            "set_priority": 100,
+            "rule": {"type": "regex", "regex": "match"},
+        },
+        {
+            "id": "low-set-deep",
+            "name": ["Deep", "Child"],
+            "set_priority": 1,
+            "rule": {"type": "regex", "regex": "match"},
+        },
+        {
+            "id": "high-set-deep",
+            "name": ["Winning", "Child"],
+            "set_priority": 2,
+            "rule": {"type": "regex", "regex": "match"},
+        },
+    ]
+
+    result = categorize_v2_explain([Event(data={"title": "match"})], categories)[0]
+    assert result.data["$category"] == ["Winning", "Child"]
+    candidates = result.data["$category_explain"]["candidates"]
+    assert [candidate["set_priority"] for candidate in candidates] == [100, 1, 2]
+
+    with pytest.raises(ValueError, match="set_priority.*integer"):
+        categorize_v2([], [{"name": ["Bad"], "set_priority": 1.5}])
+
+
+@pytest.mark.parametrize("field", ["weight", "priority", "set_priority"])
+@pytest.mark.parametrize("value", [-1_000_001, 1_000_001, True, 1.0])
+def test_categorize_v2_rejects_out_of_domain_ranking_integers(field, value):
+    category = {
+        "name": ["Invalid"],
+        "rule": {"type": "regex", "regex": "match"},
+    }
+    if field == "weight":
+        category["rule"][field] = value
+    else:
+        category[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        categorize_v2([], [category])
+
+
+def test_categorize_v2_accepts_ranking_integer_boundaries():
+    categories = [
+        {
+            "name": ["Low"],
+            "priority": -1_000_000,
+            "set_priority": -1_000_000,
+            "rule": {"type": "regex", "regex": "match", "weight": -1_000_000},
+        },
+        {
+            "name": ["High"],
+            "priority": 1_000_000,
+            "set_priority": 1_000_000,
+            "rule": {"type": "regex", "regex": "match", "weight": 1_000_000},
+        },
+    ]
+    result = categorize_v2([Event(data={"title": "match"})], categories)[0]
+    assert result.data["$category"] == ["High"]
+
+
 def test_categorize_v2_preserves_legacy_field_selection():
     categories = [
         {
@@ -807,6 +1122,60 @@ def test_categorize_v2_scalar_matching_is_opt_in():
     assert categorize_v2([Event(data={"audible": True})], scalar)[0].data[
         "$category"
     ] == ["Scalar"]
+
+
+@pytest.mark.parametrize(
+    ("value", "rendered"),
+    [
+        (1e-7, "1e-7"),
+        (1e-6, "0.000001"),
+        (1.5, "1.5"),
+        (1.0, "1"),
+        (-0.0, "0"),
+        (0.1, "0.1"),
+        (1e20, "100000000000000000000"),
+        (1e21, "1e+21"),
+        (123.456e5, "12345600"),
+        (True, "true"),
+        (9007199254740993, "9007199254740993"),
+    ],
+)
+def test_scalar_predicates_use_ecmascript_stringification(value, rendered):
+    expression = {
+        "type": "regex",
+        "source": "facts",
+        "field": "value",
+        "regex": f"^{re.escape(rendered)}$",
+        "value_mode": "scalar",
+    }
+    event = Event(data={"value": value})
+    category_rule = {
+        key: item for key, item in expression.items() if key != "source"
+    }
+    category = categorize_v2(
+        [event], [{"name": ["Matched"], "rule": category_rule}]
+    )[0]
+    assert category.data["$category"] == ["Matched"]
+    assert active_periods_v2([["facts", [Event(data={"value": value})]]], expression)
+
+
+@pytest.mark.parametrize("value", [None, {}, []])
+def test_scalar_predicates_ignore_non_scalar_json_values(value):
+    category = categorize_v2(
+        [Event(data={"value": value})],
+        [
+            {
+                "name": ["Matched"],
+                "rule": {
+                    "type": "regex",
+                    "field": "value",
+                    "regex": ".*",
+                    "value_mode": "scalar",
+                },
+            }
+        ],
+    )[0]
+    assert category.data["$category"] == ["Uncategorized"]
 
 
 def test_categorize_v2_rejects_dependency_cycles():
@@ -898,6 +1267,14 @@ def test_categorize_v2_is_repeatable():
     assert first.data["$category"] == ["First"]
     second = categorize_v2([first], categories)[0]
     assert second.data["$category"] == ["First"]
+
+
+@pytest.mark.parametrize("field", ["source", "host"])
+@pytest.mark.parametrize("value", [None, 42, [], {}, True])
+def test_categorize_v2_rejects_present_invalid_selector_types(field, value):
+    rule = {"type": "regex", "regex": "match", field: value}
+    with pytest.raises(ValueError, match=field):
+        categorize_v2([], [{"name": ["Invalid"], "rule": rule}])
 
 
 def test_categorize_v2_rejects_invalid_regex():
@@ -1011,6 +1388,95 @@ def test_union_no_overlap():
     dur = sum((e.duration for e in events_union), timedelta(0))
     assert dur == timedelta(hours=5, minutes=0)
     assert sorted(events_union, key=lambda e: e.timestamp)
+
+
+def test_union_no_overlap_long_first_suppresses_all_shorter_records():
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    high = [Event(timestamp=start, duration=60, data={"owner": "high"})]
+    low = [
+        Event(
+            timestamp=start + timedelta(seconds=offset),
+            duration=20,
+            data={"owner": "low"},
+        )
+        for offset in (0, 20, 40)
+    ]
+
+    result = union_no_overlap(high, low)
+
+    assert [(event.timestamp, event.duration, event.data) for event in result] == [
+        (start, timedelta(seconds=60), {"owner": "high"})
+    ]
+
+
+def test_union_no_overlap_reversed_streams_keep_first_stream_precedence():
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    high = [
+        Event(
+            timestamp=start + timedelta(seconds=offset),
+            duration=20,
+            data={"owner": "partitioned-high", "part": index},
+        )
+        for index, offset in enumerate((0, 20, 40))
+    ]
+    low = [Event(timestamp=start, duration=60, data={"owner": "low"})]
+
+    result = union_no_overlap(high, low)
+
+    assert result == high
+
+
+def test_union_no_overlap_trims_both_partial_boundaries():
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    high = [
+        Event(
+            timestamp=start + timedelta(seconds=10),
+            duration=10,
+            data={"owner": "high"},
+        )
+    ]
+    low = [Event(timestamp=start, duration=30, data={"owner": "low"})]
+
+    result = union_no_overlap(high, low)
+
+    assert [(event.timestamp, event.duration, event.data["owner"]) for event in result] == [
+        (start, timedelta(seconds=10), "low"),
+        (start + timedelta(seconds=10), timedelta(seconds=10), "high"),
+        (start + timedelta(seconds=20), timedelta(seconds=10), "low"),
+    ]
+
+
+def test_union_no_overlap_is_invariant_to_priority_stream_partitioning():
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    high_whole = [Event(timestamp=start, duration=60, data={"owner": "high"})]
+    high_parts = [
+        Event(
+            timestamp=start + timedelta(seconds=offset),
+            duration=20,
+            data={"owner": "high"},
+        )
+        for offset in (0, 20, 40)
+    ]
+    low = [
+        Event(
+            timestamp=start - timedelta(seconds=10),
+            duration=80,
+            data={"owner": "low"},
+        )
+    ]
+
+    whole_result = union_no_overlap(high_whole, low)
+    partitioned_result = union_no_overlap(high_parts, low)
+    whole_low = [event for event in whole_result if event.data["owner"] == "low"]
+    partitioned_low = [
+        event for event in partitioned_result if event.data["owner"] == "low"
+    ]
+
+    assert whole_low == partitioned_low
+    assert [(event.timestamp, event.duration) for event in whole_low] == [
+        (start - timedelta(seconds=10), timedelta(seconds=10)),
+        (start + timedelta(seconds=60), timedelta(seconds=10)),
+    ]
 
 
 def test_merge_subwatcher_fields_basic():

@@ -1,6 +1,8 @@
 import logging
+from copy import deepcopy
 from datetime import timedelta
 from typing import List
+
 from aw_core.models import Event
 
 logger = logging.getLogger(__name__)
@@ -8,17 +10,17 @@ logger = logging.getLogger(__name__)
 
 def sort_by_timestamp(events) -> List[Event]:
     """Sorts a list of events by timestamp"""
-    return sorted(events, key=lambda e: e.timestamp)
+    return sorted(deepcopy(events), key=lambda e: e.timestamp)
 
 
 def sort_by_duration(events) -> List[Event]:
     """Sorts a list of events by duration"""
-    return sorted(events, key=lambda e: e.duration, reverse=True)
+    return sorted(deepcopy(events), key=lambda e: e.duration, reverse=True)
 
 
 def limit_events(events, count) -> List[Event]:
     """Returns the ``count`` first events in the list of events"""
-    return events[:count]
+    return deepcopy(events[:count])
 
 
 def sum_durations(events) -> timedelta:
@@ -28,5 +30,4 @@ def sum_durations(events) -> timedelta:
 
 def concat(events1, events2) -> List[Event]:
     """Concatenates two lists of events"""
-    events = events1 + events2
-    return events
+    return deepcopy(events1 + events2)

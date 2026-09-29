@@ -1,4 +1,5 @@
 import logging
+from copy import deepcopy
 from typing import List
 
 from urllib.parse import urlparse
@@ -9,7 +10,8 @@ logger = logging.getLogger(__name__)
 
 
 def split_url_events(events: List[Event]) -> List[Event]:
-    for event in events:
+    result = deepcopy(events)
+    for event in result:
         if "url" in event.data:
             url = event.data["url"]
             parsed_url = urlparse(url)
@@ -29,4 +31,4 @@ def split_url_events(events: List[Event]) -> List[Event]:
             event.data["$options"] = parsed_url.query
             event.data["$identifier"] = parsed_url.fragment
             # TODO: Parse user, port etc aswell
-    return events
+    return result

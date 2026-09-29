@@ -103,7 +103,7 @@ def period_union(events1: List[Event], events2: List[Event]) -> List[Event]:
         events2   | ------  ---  --    ----   |
         result    | -----------  -- --------- |
     """
-    events = sorted(events1 + events2)
+    events = sorted(deepcopy(events1 + events2))
     merged_events = []
     if events:
         merged_events.append(events.pop(0))
@@ -136,8 +136,8 @@ def union(events1: List[Event], events2: List[Event]) -> List[Event]:
         events = union(events_backup, events_living)
     """
 
-    events1 = sorted(events1, key=lambda e: (e.timestamp, e.duration))
-    events2 = sorted(events2, key=lambda e: (e.timestamp, e.duration))
+    events1 = sorted(deepcopy(events1), key=lambda e: (e.timestamp, e.duration))
+    events2 = sorted(deepcopy(events2), key=lambda e: (e.timestamp, e.duration))
     events_union = []
 
     e1_i = 0

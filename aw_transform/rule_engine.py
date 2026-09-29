@@ -1,6 +1,7 @@
 import math
 import re
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Pattern, Sequence, Set, Tuple
 
@@ -13,16 +14,54 @@ MAX_EXPRESSION_NODES = 4096
 MAX_REGEX_LENGTH = 4096
 MAX_CATEGORY_RULES = 1000
 MAX_RULE_SOURCES = 128
+MIN_RANKING_INTEGER = -1_000_000
+MAX_RANKING_INTEGER = 1_000_000
 
 
-def _parse_integer(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+def _parse_ranking_integer(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
-    if isinstance(value, float) and (
-        not math.isfinite(value) or not value.is_integer()
-    ):
-        raise ValueError(f"{name} must be an integer")
-    return int(value)
+    if not MIN_RANKING_INTEGER <= value <= MAX_RANKING_INTEGER:
+        raise ValueError(
+            f"{name} must be between {MIN_RANKING_INTEGER} and {MAX_RANKING_INTEGER}"
+        )
+    return value
+
+
+def scalar_to_string(value: Any) -> Optional[str]:
+    """Return the ECMAScript string representation of a JSON scalar."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if not isinstance(value, float) or not math.isfinite(value):
+        return None
+    if value == 0:
+        return "0"
+
+    rendered = repr(value).lower()
+    if "e" not in rendered:
+        return rendered[:-2] if rendered.endswith(".0") else rendered
+
+    mantissa, raw_exponent = rendered.split("e")
+    exponent = int(raw_exponent)
+    if -6 <= exponent < 21:
+        negative = mantissa.startswith("-")
+        digits = mantissa.lstrip("-").replace(".", "")
+        decimal_position = 1 + exponent
+        if decimal_position <= 0:
+            fixed = "0." + "0" * -decimal_position + digits
+        elif decimal_position >= len(digits):
+            fixed = digits + "0" * (decimal_position - len(digits))
+        else:
+            fixed = digits[:decimal_position] + "." + digits[decimal_position:]
+        return "-" + fixed if negative else fixed
+
+    mantissa = mantissa[:-2] if mantissa.endswith(".0") else mantissa
+    sign = "+" if exponent >= 0 else "-"
+    return f"{mantissa}e{sign}{abs(exponent)}"
 
 
 @dataclass(frozen=True)
@@ -71,7 +110,7 @@ class RegexExpression(RuleExpression):
         if not isinstance(self.negate, bool):
             raise ValueError("regex rule 'negate' must be a boolean")
 
-        self.weight = _parse_integer(
+        self.weight = _parse_ranking_integer(
             spec.get("weight", 0), "regex rule 'weight'"
         )
 
@@ -80,14 +119,14 @@ class RegexExpression(RuleExpression):
             raise ValueError("regex rule 'value_mode' must be 'string' or 'scalar'")
 
         self.source = spec.get("source")
-        if self.source is not None and not isinstance(self.source, str):
+        if "source" in spec and not isinstance(self.source, str):
             raise ValueError("regex rule 'source' must be a string")
         if self.source and not re.fullmatch(r"[A-Za-z0-9_-]+", self.source):
             raise ValueError(
                 "regex rule 'source' may only contain letters, numbers, '_' and '-'"
             )
         self.host = spec.get("host")
-        if self.host is not None and (
+        if "host" in spec and (
             not isinstance(self.host, str) or not self.host
         ):
             raise ValueError("regex rule 'host' must be a non-empty string")
@@ -137,9 +176,9 @@ class RegexExpression(RuleExpression):
         if self.value_mode == "string":
             return [value for value in values if isinstance(value, str)]
         return [
-            str(value).lower() if isinstance(value, bool) else str(value)
+            normalized
             for value in values
-            if isinstance(value, (str, int, float, bool))
+            if (normalized := scalar_to_string(value)) is not None
         ]
 
     def _match_values(self, event: Event) -> Tuple[bool, int, int]:
@@ -279,6 +318,7 @@ class CategoryRule:
     name: Category
     expression: RuleExpression
     priority: int
+    set_priority: int
     requires: Tuple[str, ...]
     index: int
 
@@ -315,9 +355,14 @@ def compile_category_rules(specs: List[Dict[str, Any]]) -> List[CategoryRule]:
             raise ValueError(f"duplicate category rule id: {rule_id!r}")
         ids.add(rule_id)
 
-        priority = _parse_integer(
+        priority = _parse_ranking_integer(
             spec.get("priority", 0),
             f"category rule {rule_id!r} 'priority'",
+        )
+
+        set_priority = _parse_ranking_integer(
+            spec.get("set_priority", 0),
+            f"category rule {rule_id!r} 'set_priority'",
         )
 
         requires = spec.get("requires", [])
@@ -336,6 +381,7 @@ def compile_category_rules(specs: List[Dict[str, Any]]) -> List[CategoryRule]:
                     spec.get("rule", {"type": "none"}), _state=expression_state
                 ),
                 priority=priority,
+                set_priority=set_priority,
                 requires=tuple(requires),
                 index=index,
             )
@@ -393,14 +439,19 @@ def _eligible_rule_ids(
     return {rule_id for rule_id, eligible in eligibility.items() if eligible}
 
 
-def categorize_v2(
+def categorize_compiled(
     events: List[Event],
-    category_specs: List[Dict[str, Any]],
+    rules: List[CategoryRule],
     host: Optional[str] = None,
 ) -> List[Event]:
+    """Categorize with already compiled rules.
+
+    Compatibility adapters use this entrypoint when their input contract differs
+    from the v2 document schema. Evaluation and winner selection stay shared.
+    """
     if host is not None and (not isinstance(host, str) or not host):
         raise ValueError("categorization host must be a non-empty string")
-    rules = compile_category_rules(category_specs)
+    events = deepcopy(events)
     dependency_order = _category_dependency_order(rules)
 
     for event in events:
@@ -418,6 +469,7 @@ def categorize_v2(
                     raw_matches[rule.id].score,
                     rule.priority,
                     len(rule.name),
+                    rule.set_priority,
                     rule.index,
                 ),
             )
@@ -436,6 +488,14 @@ def categorize_v2(
     return events
 
 
+def categorize_v2(
+    events: List[Event],
+    category_specs: List[Dict[str, Any]],
+    host: Optional[str] = None,
+) -> List[Event]:
+    return categorize_compiled(events, compile_category_rules(category_specs), host)
+
+
 def categorize_v2_explain(
     events: List[Event],
     category_specs: List[Dict[str, Any]],
@@ -443,6 +503,7 @@ def categorize_v2_explain(
 ) -> List[Event]:
     if host is not None and (not isinstance(host, str) or not host):
         raise ValueError("categorization host must be a non-empty string")
+    events = deepcopy(events)
     rules = compile_category_rules(category_specs)
     dependency_order = _category_dependency_order(rules)
     rules_by_id = {rule.id: rule for rule in rules}
@@ -465,6 +526,7 @@ def categorize_v2_explain(
                     raw_matches[rule.id].score,
                     rule.priority,
                     len(rule.name),
+                    rule.set_priority,
                     rule.index,
                 ),
             )
@@ -490,6 +552,7 @@ def categorize_v2_explain(
                     "score": raw_matches[rule.id].score,
                     "priority": rule.priority,
                     "depth": len(rule.name),
+                    "set_priority": rule.set_priority,
                     "requires": list(rule.requires),
                     "requirements": {
                         required: (

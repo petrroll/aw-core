@@ -72,6 +72,20 @@ class AbstractStorage(metaclass=ABCMeta):
     ) -> List[Event]:
         raise NotImplementedError
 
+    def get_events_unclipped(
+        self,
+        bucket_id: str,
+        limit: int,
+        starttime: Optional[datetime] = None,
+        endtime: Optional[datetime] = None,
+    ) -> List[Event]:
+        """Select overlapping events without changing their stored bounds.
+
+        Storage implementations whose ordinary reads already preserve event bounds can
+        use this default. Storages that clip reads must override it.
+        """
+        return self.get_events(bucket_id, limit, starttime, endtime)
+
     def get_eventcount(
         self,
         bucket_id: str,

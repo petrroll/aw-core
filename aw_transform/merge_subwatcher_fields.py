@@ -25,7 +25,56 @@ class _ActiveSubwatcher:
             return self.period.start > other.period.start
         if self.period.end != other.period.end:
             return self.period.end > other.period.end
-        return self.input_order < other.input_order
+        return self.input_order > other.input_order
+
+
+def resolve_source_facts(events: List[Event]) -> List[Event]:
+    """Resolve competing source records into deterministic winning fact slices.
+
+    A later start wins, followed by a later end and then later input order. The
+    latter corresponds to later configured buckets and higher event IDs because
+    current source loaders preserve that concatenation order.
+    """
+    starts = {}
+    boundaries = set()
+    zero_duration = []
+    for input_order, event in enumerate(events):
+        period = _get_event_period(event)
+        if period.end == period.start:
+            zero_duration.append(deepcopy(event))
+            continue
+        if period.end < period.start:
+            continue
+        boundaries.add(period.start)
+        boundaries.add(period.end)
+        starts.setdefault(period.start, []).append(
+            _ActiveSubwatcher(event, period, input_order)
+        )
+
+    result: List[Event] = []
+    winning_orders: List[int] = []
+    active: List[_ActiveSubwatcher] = []
+    boundary_points = sorted(boundaries)
+    for start, end in zip(boundary_points, boundary_points[1:]):
+        for item in starts.get(start, []):
+            heappush(active, item)
+        while active and active[0].period.end <= start:
+            heappop(active)
+        if not active or end <= start:
+            continue
+        winner = active[0]
+        if result and winning_orders[-1] == winner.input_order:
+            result[-1].duration += end - start
+            continue
+        resolved = deepcopy(winner.event)
+        resolved.timestamp = start
+        resolved.duration = end - start
+        result.append(resolved)
+        winning_orders.append(winner.input_order)
+    return sorted(
+        result + zero_duration,
+        key=lambda event: (event.timestamp, event.timestamp + event.duration),
+    )
 
 
 def merge_subwatcher_fields(
@@ -53,8 +102,9 @@ def merge_subwatcher_fields(
     Args:
         base_events: The resolved activity stream to enrich.
         subwatcher_events: Events from a subwatcher bucket (e.g. aw-watcher-vim,
-            aw-watcher-web).  Should already be clipped via
-            ``filter_period_intersect`` before passing here.
+            aw-watcher-web). Pass the original overlapping events so their start
+            times remain available for latest-event precedence; this function
+            clips copied facts to the base-event periods itself.
         keys: Which keys to copy from the subwatcher event into the base event.
             Keys already present in the base event are left untouched when
             ``conflict="base_wins"`` (default).
@@ -74,14 +124,13 @@ def merge_subwatcher_fields(
 
         window_events = query_bucket(bid_window)
         editor_events = flood(query_bucket(bid_editor))
-        editor_events = filter_period_intersect(editor_events, window_events)
         window_events = merge_subwatcher_fields(
             window_events, editor_events, ["project", "file", "language"]
         )
         # Now categorize(window_events, ...) can match on "project"/"file"
 
     Note on overlap:
-        Base events are split at the clipped subwatcher boundaries so each
+        Base events are split at the overlapping subwatcher boundaries so each
         output segment only carries the subwatcher fields that were actually
         present during that slice of time. If multiple subwatcher events cover
         the same slice, the most recent one wins so a later transition does not
@@ -98,6 +147,7 @@ def merge_subwatcher_fields(
     if not subwatcher_events or not keys:
         return [deepcopy(e) for e in base_events]
 
+    subwatcher_events = resolve_source_facts(subwatcher_events)
     sub_sorted = sorted(
         (
             (sub, _get_event_period(sub), input_order)

@@ -1,5 +1,6 @@
 import logging
-from typing import List, Dict, Tuple
+from copy import deepcopy
+from typing import Dict, List, Tuple
 
 from aw_core.models import Event
 
@@ -14,7 +15,7 @@ def merge_events_by_keys(events, keys) -> List[Event]:
     """
     # Call recursively until all keys are consumed
     if len(keys) < 1:
-        return events
+        return deepcopy(events)
     merged_events: Dict[Tuple, Event] = {}
     for event in events:
         composite_key: Tuple = ()
@@ -31,7 +32,9 @@ def merge_events_by_keys(events, keys) -> List[Event]:
             )
             for key in keys:
                 if key in event.data:
-                    merged_events[composite_key].data[key] = event.data[key]
+                    merged_events[composite_key].data[key] = deepcopy(
+                        event.data[key]
+                    )
         else:
             merged_events[composite_key].duration += event.duration
     result = []

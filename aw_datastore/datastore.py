@@ -113,6 +113,32 @@ class Bucket:
             self.bucket_id, limit, starttime, endtime
         )
 
+    def get_unclipped(
+        self,
+        limit: int = -1,
+        starttime: Optional[datetime] = None,
+        endtime: Optional[datetime] = None,
+    ) -> List[Event]:
+        """Return overlapping events with their original stored bounds.
+
+        This is intentionally separate from ``get`` so existing API/raw-fetch
+        clipping behavior remains unchanged.
+        """
+        if starttime:
+            starttime = starttime.replace(
+                microsecond=1000 * int(starttime.microsecond / 1000)
+            )
+        if endtime:
+            milliseconds = 1 + int(endtime.microsecond / 1000)
+            second_offset = int(milliseconds / 1000)
+            microseconds = (1000 * milliseconds) % 1000000
+            endtime = endtime.replace(microsecond=microseconds) + timedelta(
+                seconds=second_offset
+            )
+        return self.ds.storage_strategy.get_events_unclipped(
+            self.bucket_id, limit, starttime, endtime
+        )
+
     def get_by_id(self, event_id) -> Optional[Event]:
         """Will return the event with the provided ID, or None if not found."""
         return self.ds.storage_strategy.get_event(self.bucket_id, event_id)

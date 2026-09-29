@@ -383,6 +383,29 @@ class PeeweeStorage(AbstractStorage):
 
         return events
 
+    def get_events_unclipped(
+        self,
+        bucket_id: str,
+        limit: int,
+        starttime: Optional[datetime] = None,
+        endtime: Optional[datetime] = None,
+    ) -> List[Event]:
+        """Fetch overlapping rows while preserving their original timestamps."""
+        if limit == 0:
+            return []
+        q = (
+            EventModel.select()
+            .where(EventModel.bucket == self.bucket_keys[bucket_id])
+            .order_by(EventModel.timestamp.desc())
+            .limit(limit)
+        )
+        # Do not use the ordinary read's 24-hour performance shortcut here:
+        # source facts can legitimately begin more than a day before the query.
+        q = self._where_range(
+            q, starttime, endtime, use_starttime_optimization=False
+        )
+        return [Event(**event) for event in map(EventModel.json, q.execute())]
+
     def get_eventcount(
         self,
         bucket_id: str,
@@ -398,6 +421,7 @@ class PeeweeStorage(AbstractStorage):
         q,
         starttime: Optional[datetime] = None,
         endtime: Optional[datetime] = None,
+        use_starttime_optimization: bool = True,
     ):
         # Important to normalize datetimes to UTC, otherwise any UTC offset will be ignored
         if starttime:
@@ -406,9 +430,10 @@ class PeeweeStorage(AbstractStorage):
             endtime = endtime.astimezone(timezone.utc)
 
         if starttime:
-            # Faster WHERE to speed up slow query below, leads to ~2-3x speedup
-            # We'll assume events aren't >24h
-            q = q.where(starttime - timedelta(hours=24) <= EventModel.timestamp)
+            # Faster WHERE to speed up ordinary reads, leads to ~2-3x speedup.
+            # The source-only raw path disables this because events can exceed 24h.
+            if use_starttime_optimization:
+                q = q.where(starttime - timedelta(hours=24) <= EventModel.timestamp)
 
             # This can be slow on large databases...
             # Tried creating various indexes and using SQLite's unlikely() function, but it had no effect
